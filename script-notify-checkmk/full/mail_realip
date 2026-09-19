@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Mail
+# Bulk: yes
+set -euo pipefail
+
+# === CONFIG ===
+CMK_URL="https://monitor.nethlab.it/monitoring"
+FROM_EMAIL="no-reply@nethesis.it"
+TO_EMAIL="${NOTIFY_CONTACTEMAIL:-root@localhost}"
+# ==============
+
+# Funzione per ottenere colore stato
+get_color() {
+    case "${1^^}" in
+        OK|UP) echo "#13d389" ;;
+        WARNING|WARN) echo "#ffd700" ;;
+        CRITICAL|CRIT|DOWN) echo "#ff5151" ;;
+        *) echo "#ff9800" ;;
+    esac
+}
+
+# Funzione per abbreviare stato
+get_label() {
+    case "${1^^}" in
+        WARNING) echo "WARN" ;;
+        CRITICAL) echo "CRIT" ;;
+        UNKNOWN) echo "UNKN" ;;
+        *) echo "${1^^}" ;;
+    esac
+}
+
+# URL encoding
+urlencode() {
+    local string="$1"
+    python3 -c "import urllib.parse; print(urllib.parse.quote('$string'), end='')" 2>/dev/null || echo "$string"
+}
+
+# Variabili CheckMK
+HOSTNAME="${NOTIFY_HOSTNAME:-Unknown}"
+SITE="${NOTIFY_OMD_SITE:-monitoring}"
+DATE="${NOTIFY_SHORTDATETIME:-$(date '+%Y-%m-%d %H:%M:%S')}"
+
+# Real IP o fallback
+REAL_IP="${NOTIFY_HOSTLABEL_real_ip:-${NOTIFY_HOSTADDRESS:-N/A}}"
+FRP="${NOTIFY_HOSTLABEL_frp_tunnel:-no}"
+
+# Service o Host?
+if [[ -n "${NOTIFY_SERVICEDESC:-}" ]]; then
+    OLD_STATE="${NOTIFY_PREVIOUSSERVICEHARDSHORTSTATE:-OK}"
+    NEW_STATE="${NOTIFY_SERVICESHORTSTATE:-UNKNOWN}"
+    OUTPUT="${NOTIFY_SERVICEOUTPUT:-N/A}"
+    LONG="${NOTIFY_LONGSERVICEOUTPUT:-}"
+    SERVICE="${NOTIFY_SERVICEDESC}"
+    SUBJECT="Checkmk: $HOSTNAME/$SERVICE $NEW_STATE"
+else
+    OLD_STATE="${NOTIFY_PREVIOUSHOSTHARDSHORTSTATE:-UP}"
+    NEW_STATE="${NOTIFY_HOSTSHORTSTATE:-DOWN}"
+    OUTPUT="${NOTIFY_HOSTOUTPUT:-N/A}"
+    LONG="${NOTIFY_LONGHOSTOUTPUT:-}"
+    SERVICE="Host Check"
+    SUBJECT="Checkmk: $HOSTNAME $NEW_STATE"
+fi
+
+# Sostituisci IP nell'output
+if [[ -n "${NOTIFY_HOSTADDRESS:-}" ]] && [[ "$NOTIFY_HOSTADDRESS" != "$REAL_IP" ]]; then
+    OUTPUT="${OUTPUT//$NOTIFY_HOSTADDRESS/$REAL_IP}"
+    LONG="${LONG//$NOTIFY_HOSTADDRESS/$REAL_IP}"
+fi
+
+# Combina output
+FULL_OUTPUT="$OUTPUT"
+[[ -n "$LONG" ]] && FULL_OUTPUT+="<br>${LONG//$'\n'/<br>}"
+
+# Colori e label
+OLD_COLOR=$(get_color "$OLD_STATE")
+NEW_COLOR=$(get_color "$NEW_STATE")
+OLD_LABEL=$(get_label "$OLD_STATE")
+NEW_LABEL=$(get_label "$NEW_STATE")
+
+# Info FRP
+FRP_ROW=""
+[[ "$FRP" == "yes" ]] && FRP_ROW="<tr><td>FRP Tunnel:</td><td><span style=\"color:#00d4aa;font-weight:600\"> Active</span> (Real IP: $REAL_IP)</td></tr>"
+
+# Link diretti a view.py
+CMK_URL="${CMK_URL%/}"
+H_ENC=$(urlencode "$HOSTNAME")
+SRV_ENC=$(urlencode "$SERVICE")
+
+if [[ "$SERVICE" != "Host Check" ]]; then
+    SRV_LINK="${CMK_URL}/check_mk/view.py?view_name=service&host=${H_ENC}&service=${SRV_ENC}"
+else
+    SRV_LINK="${CMK_URL}/check_mk/view.py?view_name=host&host=${H_ENC}"
+fi
+HOST_LINK="${CMK_URL}/check_mk/view.py?view_name=host&host=${H_ENC}"
+
+# Genera HTML ed invia con sendmail
+{
+    echo "To: $TO_EMAIL"
+    echo "From: $FROM_EMAIL"
+    echo "Subject: $SUBJECT"
+    echo "Content-Type: text/html; charset=UTF-8"
+    echo "MIME-Version: 1.0"
+    echo ""
+    cat <<EOF
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#f5f5f5;margin:0;padding:20px}
+.container{max-width:650px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1);border:2px solid #e0e0e0}
+.header{background:#f8f9fa;padding:20px;display:flex;align-items:center;gap:10px;border-bottom:2px solid #d0d0d0}
+.logo-icon{width:24px;height:24px;background:#00d4aa;border-radius:4px;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:14px}
+.logo-text{color:#00d4aa;font-size:18px;font-weight:600}
+.status-bar{background:linear-gradient(90deg,${OLD_COLOR} 0%,${OLD_COLOR} 48%,#666 48%,#666 52%,${NEW_COLOR} 52%,${NEW_COLOR} 100%);height:6px;border-bottom:1px solid rgba(0,0,0,.15)}
+.content{padding:30px}
+.event-row{background:#f8f9fa;padding:15px 20px;border-radius:6px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;border:1px solid #e0e0e0}
+.event-label{color:#666;font-size:14px;font-weight:500}
+.event-value{color:#333;font-size:14px;word-break:break-word}
+.state-badge{padding:6px 14px;border-radius:4px;font-weight:600;font-size:13px;color:#fff;background-color:${NEW_COLOR};white-space:nowrap}
+.section-title{color:#999;font-size:18px;font-weight:600;margin:20px 0 15px}
+.info-table{width:100%;border-collapse:collapse;margin-bottom:25px}
+.info-table td{padding:10px 0;border-bottom:1px solid #e0e0e0;word-break:break-word}
+.info-table td:first-child{color:#333;font-weight:600;width:140px}
+.info-table td:last-child{color:#666}
+.service-details{background:linear-gradient(135deg,#fafafa 0%,#f5f5f5 100%);padding:20px;border-radius:8px;border:1px solid ${NEW_COLOR};border-left:6px solid ${NEW_COLOR};margin-top:15px;overflow-x:auto;box-shadow:0 2px 4px rgba(0,0,0,.05)}
+.service-details pre{margin:0;white-space:pre-wrap;word-wrap:break-word;font-family:'Courier New',monospace;font-size:13px;color:#333;line-height:1.6}
+.footer{background:#f8f8f8;padding:20px;text-align:center;color:#666;font-size:13px}
+.buttons{margin-top:15px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-block;padding:12px 24px;background:${NEW_COLOR};color:#fff;text-decoration:none;border-radius:4px;font-weight:600;font-size:14px;min-width:120px;border:2px solid #000;transition:filter 0.2s}
+.btn:hover{filter:brightness(0.85)}
+@media(max-width:600px){
+body{padding:10px}
+.content{padding:15px}
+.header{padding:15px}
+.event-row{padding:12px 15px;flex-direction:column;align-items:flex-start}
+.info-table td:first-child{width:100px;font-size:13px}
+.info-table td:last-child{font-size:13px}
+.section-title{font-size:16px}
+.btn{width:100%;min-width:auto;padding:14px 20px;font-size:15px}
+.buttons{gap:8px}
+}
+</style></head>
+<body>
+<div class="container">
+<div class="header"><div class="logo-icon"></div><span class="logo-text">checkmk</span></div>
+<div class="status-bar"></div>
+<div class="content">
+<div class="event-row"><span class="event-label">Event:</span><div><span class="state-badge" style="background:${OLD_COLOR}">${OLD_LABEL}</span> → <span class="state-badge">${NEW_LABEL}</span></div></div>
+<div class="event-row"><span class="event-label">Service:</span><span class="event-value">${SERVICE}</span></div>
+<div class="event-row"><span class="event-label">Host:</span><span class="event-value">${HOSTNAME}</span></div>
+<h2 class="section-title"> Event overview</h2>
+<table class="info-table">
+<tr><td>Event date:</td><td>${DATE}</td></tr>
+<tr><td>Address:</td><td>${REAL_IP}</td></tr>
+${FRP_ROW}
+<tr><td>Site:</td><td>${SITE}</td></tr>
+<tr><td>Summary:</td><td>${OUTPUT//$'\n'/<br>}</td></tr>
+</table>
+<h2 class="section-title"> Service details:</h2>
+<div class="service-details"><pre>${FULL_OUTPUT}</pre></div>
+</div>
+<div class="footer">Sent by Checkmk<div class="buttons"><a href="${SRV_LINK}" class="btn">Service</a><a href="${HOST_LINK}" class="btn">Host</a></div></div>
+</div>
+</body>
+</html>
+EOF
+} | /usr/sbin/sendmail -t

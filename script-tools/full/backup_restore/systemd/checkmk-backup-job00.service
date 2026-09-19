@@ -1,0 +1,15 @@
+[Unit]
+Description=CheckMK Job00 Daily Backup Management (Compressed 1.2MB)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/checkmk-tools/script-tools/full/backup_restore/checkmk_manage_job00_daily.py
+User=root
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Telegram Self-Monitoring - v1.1.0
+# Script dedicato per notifiche dell'host "monitor" (self-monitoring CheckMK)
+set -euo pipefail
+
+# === CONFIG ===
+TOKEN="${TELEGRAM_TOKEN:-}"
+# CHAT_ID da variabile d'ambiente TELEGRAM_SELFMON_CHAT_ID (configurare per server in OMD environment)
+CHAT_ID="${TELEGRAM_SELFMON_CHAT_ID:-}"
+
+CMK_URL="https://monitor.nethlab.it/monitoring"
+SITE="monitoring"
+# ==============
+
+get_emoji() {
+  case "$1" in
+    OK|UP) echo -n "" ;; # green circle
+    WARN|WARNING) echo -n "" ;; # yellow circle
+    CRIT|CRITICAL|DOWN) echo -n "" ;; # red circle
+    UNKNOWN) echo -n "" ;; # warning
+    *) echo -n "" ;; # cross mark
+  esac
+}
+
+# URL-encode helper (returns value instead of printing directly)
+urlencode() {
+  local raw="${1:-}"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]), end="")' "$raw" 2>/dev/null || true
+  else
+    echo -n "$raw" | sed 's/ /%20/g'
+  fi
+}
+
+# Se la label real_ip esiste la usiamo, altrimenti cadiamo su NOTIFY_HOSTADDRESS
+REAL_IP="${NOTIFY_HOSTLABEL_real_ip:-${NOTIFY_HOSTADDRESS:-}}"
+
+# Costruzione messaggio
+if [[ "${NOTIFY_WHAT:-SERVICE}" = "SERVICE" ]]; then
+  EMOJI="$(get_emoji "${NOTIFY_SERVICESTATE:-UNKNOWN}")"
+  SERVICE_ENC="$(urlencode "${NOTIFY_SERVICEDESC:-SERVICE}")"
+
+  SERVICE_LINK="${CMK_URL}/check_mk/view.py?view_name=service&host=${NOTIFY_HOSTNAME:-}&service=${SERVICE_ENC}&site=${SITE}"
+  HOST_LINK="${CMK_URL}/check_mk/view.py?view_name=host&host=${NOTIFY_HOSTNAME:-}&site=${SITE}"
+
+  MSG="[${EMOJI} ${NOTIFY_SERVICESTATE:-UNKNOWN}] Servizio → ${NOTIFY_SERVICEDESC:-}
+Host: ${NOTIFY_HOSTNAME:-unknown} (${REAL_IP})
+Output: ${NOTIFY_SERVICEOUTPUT:-N/A}"
+
+  BUTTON='{"inline_keyboard":[[{"text":" Servizio","url":"'"$SERVICE_LINK"'"},{"text":" Host","url":"'"$HOST_LINK"'"}]]}'
+else
+  EMOJI="$(get_emoji "${NOTIFY_HOSTSTATE:-UNKNOWN}")"
+  HOST_LINK="${CMK_URL}/check_mk/view.py?view_name=host&host=${NOTIFY_HOSTNAME:-}&site=${SITE}"
+
+  MSG="[${EMOJI} ${NOTIFY_HOSTSTATE:-UNKNOWN}] Host → ${NOTIFY_HOSTNAME:-unknown}
+IP: ${REAL_IP}
+Output: ${NOTIFY_HOSTOUTPUT:-N/A}"
+
+  BUTTON='{"inline_keyboard":[[{"text":" Host","url":"'"$HOST_LINK"'"}]]}'
+fi
+
+# Prefisso dedicato self-monitoring
+MSG=" [SELF-MONITOR]  $MSG"
+
+# Invio con logging errori
+RESPONSE=$(curl -sS -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+  -d chat_id="${CHAT_ID}" \
+  -d text="$MSG" \
+  --data-urlencode "reply_markup=$BUTTON" 2>&1)
+
+if echo "$RESPONSE" | grep -q '"ok":true'; then
+  echo "Telegram OK: message sent"
+  exit 0
+else
+  echo "Telegram ERROR: $RESPONSE"
+  exit 1
+fi

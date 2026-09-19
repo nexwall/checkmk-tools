@@ -1,0 +1,11 @@
+[Unit]
+Description=CheckMK Job01 Weekly Backup Timer
+Requires=checkmk-backup-job01.service
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

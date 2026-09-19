@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+"""
+ydea_la_testing - Ydea Ticketing Integration with Smart Detection (LA Testing Environment)
+Bulk: no
+
+CheckMK notification script - integrates with Ydea ticketing system.
+Features: smart detection, flapping protection, host aggregation, cache management.
+
+Version: 1.0.5
+"""
+
+import os
+import sys
+import json
+import subprocess
+import fcntl
+import time
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Dict, Any, Tuple, List
+
+VERSION = "1.3.0"
+
+# ===== CONFIG =====
+YDEA_TOOLKIT_DIR = "/opt/ydea-toolkit"
+YDEA_ENV = f"{YDEA_TOOLKIT_DIR}/.env.la_testing"
+YDEA_CONFIG = f"{YDEA_TOOLKIT_DIR}/config/premium-mon-config.json"
+YDEA_CACHE_DIR = "/opt/ydea-toolkit/cache"
+TICKET_CACHE = f"{YDEA_CACHE_DIR}/ydea_checkmk_tickets_testing.json"
+FLAPPING_CACHE = f"{YDEA_CACHE_DIR}/ydea_checkmk_flapping_testing.json"
+CACHE_LOCK = f"{YDEA_CACHE_DIR}/ydea_cache_testing.lock"
+
+RESOLVED_TICKET_TTL = 5 * 24 * 3600  # 5 giorni
+CACHE_MAX_AGE = 30 * 24 * 3600  # 30 giorni
+FLAPPING_THRESHOLD = 5  # Numero cambi stato
+FLAPPING_WINDOW = 600  # 10 minuti
+EFFETTUATO_GRACE_SECONDS = 24 * 3600  # 24 ore finestra grace post-Effettuato
+
+AGGREGATE_BY_HOST = int(os.getenv("AGGREGATE_BY_HOST", "1"))
+RESOLVE_ON_SERVICE_OK = int(os.getenv("RESOLVE_ON_SERVICE_OK", "0"))
+YDEA_CATEGORY_ID = int(os.getenv("YDEA_CATEGORY_ID", "147"))
+YDEA_USER_ID = int(os.getenv("YDEA_USER_ID", "12336"))  # Lorenzo Angelini (LA)
+YDEA_TOOLKIT_TIMEOUT = int(os.getenv("YDEA_TOOLKIT_TIMEOUT", "25"))
+DEBUG_YDEA = os.getenv("DEBUG_YDEA", "0") == "1"
+
+
+def parse_json_response(output: str) -> Optional[Dict[str, Any]]:
+    """Parse JSON object from toolkit output (supports multiline pretty JSON)."""
+    text = (output or "").strip()
+    if not text:
+        return None
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    snippet = text[start:end + 1]
+    try:
+        parsed = json.loads(snippet)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+
+    return None
+
+
+def resolve_toolkit_command() -> Optional[List[str]]:
+    """Resolve ydea toolkit executable (prefer Python implementation)."""
+    python_cmd = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else "python3"
+    candidates: List[Tuple[str, List[str]]] = [
+        (f"{YDEA_TOOLKIT_DIR}/ydea-toolkit.py", [python_cmd, f"{YDEA_TOOLKIT_DIR}/ydea-toolkit.py"]),
+        (f"{YDEA_TOOLKIT_DIR}/rydea-toolkit.py", [python_cmd, f"{YDEA_TOOLKIT_DIR}/rydea-toolkit.py"]),
+        (f"{YDEA_TOOLKIT_DIR}/ydea-toolkit.sh", [f"{YDEA_TOOLKIT_DIR}/ydea-toolkit.sh"]),
+        (f"{YDEA_TOOLKIT_DIR}/rydea-toolkit.sh", [f"{YDEA_TOOLKIT_DIR}/rydea-toolkit.sh"]),
+    ]
+    for check_path, cmd in candidates:
+        if os.path.exists(check_path):
+            return cmd
+    return None
+
+
+def log(msg: str):
+    """Log message to stderr."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}", file=sys.stderr)
+
+
+def debug(msg: str):
+    """Debug log if enabled."""
+    if DEBUG_YDEA:
+        log(f"DEBUG: {msg}")
+
+
+def log_ticket_event(event_type: str, ticket_id: int, details: str = ""):
+    """Log ticket event."""
+    log(f"[TICKET-EVENT] [{event_type}] #{ticket_id} {details}")
+
+
+def send_telegram_error(msg: str, hostname: str = "", service: str = "") -> None:
+    """Send error notification to Telegram. Silently fails if not configured."""
+    token = os.environ.get("TELEGRAM_TOKEN", "")
+    chat_id = (os.environ.get("TELEGRAM_NOTIFY_CHAT_ID") or
+               os.environ.get("TELEGRAM_SELFMON_CHAT_ID", ""))
+    if not token or not chat_id:
+        return
+    try:
+        import urllib.request
+        import urllib.parse
+        text = "[YDEA-LA-TESTING ERROR]\n" + msg
+        if hostname:
+            text += f"\nHost: {hostname}"
+        if service:
+            text += f"\nServizio: {service}"
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=data,
+            method="POST"
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # Never break the script because of Telegram failure
+
+
+def toolkit_cmd(args: List[str], timeout: Optional[int] = None) -> Tuple[int, str, str]:
+    """Execute ydea-toolkit command with environment loaded from YDEA_ENV."""
+    if timeout is None:
+        timeout = YDEA_TOOLKIT_TIMEOUT
+    
+    # Load environment variables from YDEA_ENV file
+    env = os.environ.copy()
+    if not os.path.exists(YDEA_ENV):
+        msg = f"ERROR: Env file not found: {YDEA_ENV}"
+        log(msg)
+        send_telegram_error(msg)
+        sys.exit(1)
+    try:
+        with open(YDEA_ENV, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    # Parse export VAR="value" or VAR=value
+                    line = line.replace('export ', '', 1).strip()
+                    key, value = line.split('=', 1)
+                    # Remove quotes if present
+                    value = value.strip().strip('"').strip("'")
+                    # Handle ${HOME} expansion
+                    value = value.replace('${HOME}', os.path.expanduser('~'))
+                    env[key.strip()] = value
+                    os.environ[key.strip()] = value  # also update os.environ for Telegram vars
+    except Exception as e:
+        msg = f"ERROR: Failed to load {YDEA_ENV}: {e}"
+        log(msg)
+        send_telegram_error(msg)
+        sys.exit(1)
+    
+    base_cmd = resolve_toolkit_command()
+    if not base_cmd:
+        msg = ("Ydea toolkit not found "
+               f"(checked: {YDEA_TOOLKIT_DIR}/ydea-toolkit.py, {YDEA_TOOLKIT_DIR}/rydea-toolkit.py, "
+               f"{YDEA_TOOLKIT_DIR}/ydea-toolkit.sh, {YDEA_TOOLKIT_DIR}/rydea-toolkit.sh)")
+        log(f"ERROR: {msg}")
+        send_telegram_error(msg)
+        return 127, "", "Command not found"
+
+    cmd = base_cmd + args
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            env=env
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        log(f"ERROR: toolkit command timeout after {timeout}s")
+        return 124, "", "Timeout"
+    except FileNotFoundError:
+        log(f"ERROR: {' '.join(base_cmd)} not found")
+        return 127, "", "Command not found"
+    except Exception as e:
+        log(f"ERROR: toolkit command failed: {e}")
+        return 1, "", str(e)
+
+
+def atomic_cache_write(cache_file: str, content: str) -> bool:
+    """Atomic cache write with flock."""
+    cache_path = Path(cache_file)
+    cache_dir = cache_path.parent
+    
+    if not os.access(cache_dir, os.W_OK):
+        log(f"ERROR: No write permission on {cache_dir}")
+        return False
+    
+    temp_file = f"{cache_file}.tmp.{os.getpid()}"
+    lock_file = Path(CACHE_LOCK)
+    
+    try:
+        # Ensure lock file exists
+        lock_file.touch(mode=0o666, exist_ok=True)
+        
+        with open(lock_file, 'r') as lock_fd:
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except IOError:
+                # Lock failed, try with timeout
+                try:
+                    fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+                except IOError:
+                    log(f"WARN: Timeout acquiring lock, fallback direct write")
+                    with open(cache_file, 'w') as f:
+                        f.write(content)
+                    os.chmod(cache_file, 0o666)
+                    return True
+            
+            # Write to temp file
+            with open(temp_file, 'w') as f:
+                f.write(content)
+            os.chmod(temp_file, 0o666)
+            os.sync()
+            
+            # Atomic move
+            os.replace(temp_file, cache_file)
+            os.chmod(cache_file, 0o666)
+            os.sync()
+            
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        
+        debug(f"atomic_cache_write OK: {cache_file}")
+        return True
+        
+    except Exception as e:
+        log(f"ERROR: atomic_cache_write failed: {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        return False
+
+
+def init_cache():
+    """Initialize cache with validation."""
+    cache_dir = Path(YDEA_CACHE_DIR)
+    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
+    
+    lock_path = Path(CACHE_LOCK)
+    if not lock_path.exists():
+        lock_path.touch(mode=0o666, exist_ok=True)
+    
+    # Initialize TICKET_CACHE
+    ticket_path = Path(TICKET_CACHE)
+    if not ticket_path.exists():
+        atomic_cache_write(TICKET_CACHE, '{}')
+    else:
+        try:
+            with open(TICKET_CACHE, 'r') as f:
+                data = json.load(f)
+            
+            # Clean invalid entries
+            cleaned = {}
+            for key, value in data.items():
+                if value.get('ticket_id') and isinstance(value['ticket_id'], (int, str)):
+                    try:
+                        int(value['ticket_id'])
+                        cleaned[key] = value
+                    except ValueError:
+                        pass
+            
+            if cleaned != data:
+                atomic_cache_write(TICKET_CACHE, json.dumps(cleaned))
+                
+        except json.JSONDecodeError:
+            log("WARN: Cache ticket corrupted, reset")
+            backup = f"{TICKET_CACHE}.corrupt.{int(time.time())}"
+            try:
+                os.rename(TICKET_CACHE, backup)
+            except:
+                pass
+            atomic_cache_write(TICKET_CACHE, '{}')
+    
+    # Initialize FLAPPING_CACHE
+    flapping_path = Path(FLAPPING_CACHE)
+    if not flapping_path.exists():
+        atomic_cache_write(FLAPPING_CACHE, '{}')
+    else:
+        try:
+            with open(FLAPPING_CACHE, 'r') as f:
+                json.load(f)
+        except json.JSONDecodeError:
+            log("WARN: Cache flapping corrupted, reset")
+            backup = f"{FLAPPING_CACHE}.corrupt.{int(time.time())}"
+            try:
+                os.rename(FLAPPING_CACHE, backup)
+            except:
+                pass
+            atomic_cache_write(FLAPPING_CACHE, '{}')
+    
+    clean_old_cache_entries()
+
+
+def clean_old_cache_entries():
+    """Clean old cache entries."""
+    now = int(time.time())
+    resolved_cutoff = now - RESOLVED_TICKET_TTL
+    active_cutoff = now - CACHE_MAX_AGE
+    
+    try:
+        with open(TICKET_CACHE, 'r') as f:
+            data = json.load(f)
+        
+        cleaned = {}
+        for key, value in data.items():
+            resolved_at = value.get('resolved_at')
+            last_update = value.get('last_update')
+            
+            if resolved_at:
+                if resolved_at > resolved_cutoff:
+                    cleaned[key] = value
+            elif last_update and last_update > active_cutoff:
+                cleaned[key] = value
+        
+        if cleaned != data:
+            atomic_cache_write(TICKET_CACHE, json.dumps(cleaned))
+            debug("Cache cleaned: removed old entries")
+    except Exception as e:
+        debug(f"clean_old_cache_entries failed: {e}")
+
+
+def get_ticket_key(host: str, service: str = "HOST") -> str:
+    """Generate unique ticket key."""
+    if AGGREGATE_BY_HOST == 1:
+        return host
+    else:
+        return f"{host}:{service}"
+
+
+def ticket_exists(key: str) -> bool:
+    """Check if ticket exists in cache."""
+    try:
+        with open(TICKET_CACHE, 'r') as f:
+            data = json.load(f)
+        return key in data
+    except:
+        return False
+
+
+def get_ticket_id(key: str) -> Optional[int]:
+    """Get ticket ID from cache."""
+    try:
+        with open(TICKET_CACHE, 'r') as f:
+            data = json.load(f)
+        ticket_id = data.get(key, {}).get('ticket_id')
+        return int(ticket_id) if ticket_id else None
+    except:
+        return None
+
+
+def save_ticket_cache(key: str, ticket_id: int, state: str):
+    """Save ticket to cache."""
+    init_cache()
+    
+    try:
+        with open(TICKET_CACHE, 'r') as f:
+            data = json.load(f)
+    except:
+        data = {}
+    
+    now = int(time.time())
+    data[key] = {
+        'ticket_id': ticket_id,
+        'state': state,
+        'created_at': now,
+        'last_update': now,
+        'resolved_at': None
+    }
+    
+    atomic_cache_write(TICKET_CACHE, json.dumps(data))
+    debug(f"Ticket saved in cache: {key} -> {ticket_id}")
+
+
+def mark_ticket_resolved(key: str):
+    """Mark ticket as resolved."""
+    init_cache()
+    
+    if not ticket_exists(key):
+        debug(f"Ticket {key} not in cache, skip mark_resolved")
+        return
+    
+    try:
+        with open(TICKET_CACHE, 'r') as f:
+            data = json.load(f)
+        
+        now = int(time.time())
+        if key in data:
+            data[key]['resolved_at'] = now
+            data[key]['effettuato_at'] = now
+            data[key]['reopen_at'] = None
+            data[key]['last_update'] = now
+            atomic_cache_write(TICKET_CACHE, json.dumps(data))
+            debug(f"Ticket {key} marked as resolved (effettuato_at set)")
+    except Exception as e:
+        log(f"WARN: mark_ticket_resolved failed: {e}")
+
+
+def update_ticket_state(key: str, state: str):
+    """Update ticket state in cache."""
+    init_cache()
+    
+    try:
+        with open(TICKET_CACHE, 'r') as f:
+            data = json.load(f)
+        
+        now = int(time.time())
+        if key in data:
+            data[key]['state'] = state
+            data[key]['last_update'] = now
+            
+            # Reset resolved_at on CRITICAL/DOWN
+            if state in ['CRITICAL', 'CRIT', 'DOWN']:
+                data[key]['resolved_at'] = None
+            
+            atomic_cache_write(TICKET_CACHE, json.dumps(data))
+    except Exception as e:
+        log(f"WARN: update_ticket_state failed: {e}")
+
+
+def remove_ticket_from_cache(key: str):
+    """Remove ticket from cache."""
+    try:
+        with open(TICKET_CACHE, 'r') as f:
+            data = json.load(f)
+        
+        if key in data:
+            del data[key]
+            atomic_cache_write(TICKET_CACHE, json.dumps(data))
+            debug(f"Ticket {key} removed from cache")
+    except Exception as e:
+        log(f"WARN: remove_ticket_from_cache failed: {e}")
+
+
+def get_cache_field(key: str, field: str) -> Any:
+    """Get a field value from ticket cache entry."""
+    try:
+        with open(TICKET_CACHE, 'r') as f:
+            data = json.load(f)
+        return data.get(key, {}).get(field)
+    except:
+        return None
+
+
+def set_cache_field(key: str, field: str, value: Any) -> bool:
+    """Set a field in ticket cache entry."""
+    try:
+        with open(TICKET_CACHE, 'r') as f:
+            data = json.load(f)
+        if key in data:
+            data[key][field] = value
+            data[key]['last_update'] = int(time.time())
+            atomic_cache_write(TICKET_CACHE, json.dumps(data))
+            return True
+        return False
+    except Exception as e:
+        log(f"WARN: set_cache_field({field}) failed: {e}")
+        return False
+
+
+def check_effettuato_grace(key: str) -> Optional[bool]:
+    """
+    Controlla se il ticket e' nella finestra grace 24h post-Effettuato.
+    Returns:
+      None  -> ticket attivo (non in stato Effettuato, o gia' riaperto)
+      True  -> in finestra grace (< 24h da effettuato_at)
+      False -> fuori finestra grace (>= 24h)
+    """
+    # Se il ticket e' stato riaperto da un CRITICAL, trattalo come attivo
+    if get_cache_field(key, 'reopen_at') is not None:
+        debug(f"Ticket {key}: reopen_at set -> attivo")
+        return None
+
+    effettuato_at = get_cache_field(key, 'effettuato_at')
+    if not effettuato_at:
+        return None  # Nessuna finestra grace attiva
+
+    now = int(time.time())
+    elapsed = now - int(effettuato_at)
+    in_grace = elapsed < EFFETTUATO_GRACE_SECONDS
+    debug(f"Ticket {key}: effettuato {elapsed/3600:.1f}h fa, in_grace={in_grace}")
+    return in_grace
+
+
+RESOLVED_STATES = {'effettuato', 'chiuso', 'completato', 'risolto'}
+
+
+def fetch_ticket_stato(ticket_id: int) -> Optional[str]:
+    """
+    Interroga Ydea per lo stato attuale del ticket.
+    Ritorna il valore di 'stato' (es. 'Effettuato') o None in caso di errore/404.
+    """
+    exitcode, stdout, stderr = toolkit_cmd(['get', str(ticket_id)], timeout=15)
+    if exitcode != 0:
+        output_lower = (stdout + stderr).lower()
+        if '404' in output_lower or 'non trovato' in output_lower:
+            return None
+        debug(f"fetch_ticket_stato: get #{ticket_id} failed (code {exitcode})")
+        return None
+    response = parse_json_response(stdout)
+    if not response:
+        return None
+    return response.get('stato') or response.get('status')
+
+
+def record_state_change(key: str, state: str):
+    """Record state change for flapping detection."""
+    now = int(time.time())
+    init_cache()
+    
+    try:
+        with open(FLAPPING_CACHE, 'r') as f:
+            data = json.load(f)
+    except:
+        data = {}
+    
+    if key not in data:
+        data[key] = []
+    
+    data[key].append({'state': state, 'timestamp': now})
+    atomic_cache_write(FLAPPING_CACHE, json.dumps(data))
+
+
+def is_flapping(key: str) -> Tuple[bool, str]:
+    """Check if service is flapping."""
+    try:
+        with open(FLAPPING_CACHE, 'r') as f:
+            data = json.load(f)
+        
+        if key not in data:
+            return False, ""
+        
+        changes = data[key]
+        now = int(time.time())
+        window_start = now - FLAPPING_WINDOW
+        
+        # Filter recent changes
+        recent = [c for c in changes if c['timestamp'] >= window_start]
+        
+        if len(recent) >= FLAPPING_THRESHOLD:
+            count = len(recent)
+            minutes = FLAPPING_WINDOW // 60
+            return True, f" FLAPPING: {count} cambi stato in {minutes} minuti"
+        
+        return False, ""
+    except:
+        return False, ""
+
+
+def determine_tipo(hostname: str, service: str, output: str) -> str:
+    """Determine Ydea type from config."""
+    if not os.path.exists(YDEA_CONFIG):
+        debug(f"Config file not found: {YDEA_CONFIG}, using default 'Server'")
+        return "Server"
+    
+    # Check CheckMK label
+    os_family = os.getenv("NOTIFY_HOSTLABEL_cmk_os_family", "")
+    if os_family:
+        debug(f"Using OS family from label: {os_family}")
+        # Map OS family to tipo
+        os_map = {
+            "linux": "Server",
+            "windows": "Server",
+            "unix": "Server"
+        }
+        return os_map.get(os_family.lower(), "Server")
+    
+    # Default
+    return "Server"
+
+
+def build_cmk_marker(hostname: str, ip: str) -> str:
+    """Build CheckMK marker for ticket search."""
+    return f"[CMK HOST={hostname} IP={ip}]"
+
+
+def create_ydea_ticket(title: str, description: str, priority: str, 
+                       category_id: int, hostname: str, service: str, 
+                       output: str) -> Optional[int]:
+    """Create Ydea ticket."""
+    tipo = determine_tipo(hostname, service, output)
+    debug(f"Creating ticket: {title} (category: {category_id}, tipo: {tipo})")
+    
+    exitcode, stdout, stderr = toolkit_cmd(['create', title, description, 
+                                            priority, str(category_id), tipo, 
+                                            str(YDEA_USER_ID)])
+    
+    if exitcode != 0:
+        err_text = (stderr or stdout or "").strip()
+        if exitcode == 124:
+            msg = f"Create ticket timeout after {YDEA_TOOLKIT_TIMEOUT}s"
+        else:
+            msg = f"Create ticket failed (code {exitcode}): {err_text}"
+        log(f"ERROR: {msg}")
+        send_telegram_error(msg, hostname, service)
+        return None
+
+    response = parse_json_response(stdout)
+    if not response:
+        msg = f"Parse create response failed: invalid JSON output: {(stdout or '').strip()}"
+        log(f"ERROR: {msg}")
+        send_telegram_error(msg, hostname, service)
+        return None
+
+    ticket_id = response.get('ticket_id') or response.get('id') or response.get('data', {}).get('id')
+    if not ticket_id:
+        msg = f"No ticket_id in response: {(stdout or '').strip()}"
+        log(f"ERROR: {msg}")
+        send_telegram_error(msg, hostname, service)
+        return None
+
+    try:
+        ticket_id = int(ticket_id)
+    except Exception:
+        log(f"ERROR: Invalid ticket_id in response: {ticket_id}")
+        return None
+
+    # Add description as public comment
+    if description:
+        debug(f"Adding description as public comment to ticket #{ticket_id}")
+        toolkit_cmd(['comment', str(ticket_id), description, 'true'])
+
+    return ticket_id
+
+
+def add_private_note(ticket_id: int, note: str) -> int:
+    """Add private note to ticket. Returns: 0=success, 1=error, 2=404."""
+    debug(f"Adding private note to ticket #{ticket_id}")
+
+    exitcode, stdout, stderr = toolkit_cmd(['comment', str(ticket_id), note])
+
+    if exitcode != 0:
+        output_lower = (stdout + stderr).lower()
+        if '404' in output_lower or 'not found' in output_lower or 'ticket non trovato' in output_lower:
+            log(f"WARN: Ticket #{ticket_id} not found (404)")
+            return 2
+
+        if exitcode == 124:
+            msg = f"Add note timeout on #{ticket_id} after {YDEA_TOOLKIT_TIMEOUT}s"
+        else:
+            msg = f"Add note failed on #{ticket_id}: {stderr}"
+        log(f"ERROR: {msg}")
+        send_telegram_error(msg)
+        return 1
+
+    return 0
+
+
+def detect_alert_type(output: str, old_state: str, new_state: str) -> str:
+    """Detect alert type from output."""
+    output_lower = output.lower()
+    
+    # Communication timeout
+    if 'socket.timeout' in output_lower or 'read timed out' in output_lower:
+        return "COMMUNICATION_TIMEOUT"
+    
+    # Connection refused
+    if 'connection refused' in output_lower or 'errno 111' in output_lower or 'connessione' in output_lower and 'rifiutata' in output_lower:
+        return "HOST_OFFLINE_REFUSED"
+    
+    # Network unreachable
+    if 'network unreachable' in output_lower or 'errno 113' in output_lower or 'rete' in output_lower and 'raggiungibile' in output_lower:
+        return "HOST_OFFLINE_NETWORK"
+    
+    # Timeout
+    if 'timeout' in output_lower or 'timed out' in output_lower or 'no route' in output_lower:
+        return "HOST_OFFLINE_TIMEOUT"
+    
+    # No data
+    if 'no data' in output_lower or 'piggyback' in output_lower or 'missing' in output_lower and 'data' in output_lower or 'stale cache' in output_lower:
+        return "HOST_NODATA"
+    
+    return "UNKNOWN"
+
+
+def get_alert_label(alert_type: str, what: str, service: str) -> str:
+    """Get human-readable alert label."""
+    labels = {
+        "HOST_OFFLINE_REFUSED": "Connection Refused",
+        "HOST_OFFLINE_NETWORK": "Network Unreachable",
+        "HOST_OFFLINE_TIMEOUT": "Timeout",
+        "HOST_NODATA": "No Data",
+        "COMMUNICATION_TIMEOUT": "Communication Timeout",
+        "UNKNOWN": "Alert"
+    }
+    return labels.get(alert_type, "Alert")
+
+
+def generate_smart_description(alert_type: str, hostname: str, ip: str,
+                               output: str, service: str, state: str,
+                               last_state: str, long_output: str = "") -> str:
+    """Generate smart description based on alert type."""
+
+    # Build full output block (output + long_output if present)
+    output_block = f"Output: {output}"
+    if long_output:
+        output_block += f"\n{long_output}"
+
+    titles = {
+        "HOST_OFFLINE_REFUSED": "*** ALERT - CONNESSIONE RIFIUTATA ***",
+        "HOST_OFFLINE_NETWORK": "*** ALERT - NETWORK UNREACHABLE ***",
+        "HOST_OFFLINE_TIMEOUT": "*** ALERT - HOST TIMEOUT ***",
+        "HOST_NODATA":          "*** ALERT - DATI DI MONITORAGGIO MANCANTI ***",
+    }
+    title_line = titles.get(alert_type, "*** ALERT MONITORAGGIO ***")
+
+    return f"""{title_line}
+
+Host: {hostname} ({ip})
+Servizio: {service}
+Stato: {state}
+{output_block}
+
+[CMK HOST={hostname} IP={ip}]"""
+
+
+def main():
+    """Main notification handler."""
+    init_cache()
+    
+    # Get CheckMK variables
+    hostname = os.getenv("NOTIFY_HOSTNAME", "unknown")
+    real_ip = os.getenv("NOTIFY_HOSTLABEL_real_ip", os.getenv("NOTIFY_HOSTADDRESS", "N/A"))
+    what = os.getenv("NOTIFY_WHAT", "SERVICE")
+    
+    if what == "SERVICE":
+        service = os.getenv("NOTIFY_SERVICEDESC", "SERVICE")
+        state = os.getenv("NOTIFY_SERVICESHORTSTATE", "UNKNOWN")
+        last_state = os.getenv("NOTIFY_PREVIOUSSERVICEHARDSHORTSTATE", "OK")
+        output = os.getenv("NOTIFY_SERVICEOUTPUT", "N/A")
+    else:
+        service = "HOST"
+        state = os.getenv("NOTIFY_HOSTSHORTSTATE", "UNKNOWN")
+        last_state = os.getenv("NOTIFY_PREVIOUSHOSTHARDSHORTSTATE", "UP")
+        output = os.getenv("NOTIFY_HOSTOUTPUT", "N/A")
+    
+    # Full output including long output (no truncation)
+    if what == "SERVICE":
+        long_output = os.getenv("NOTIFY_SERVICELONGOUTPUT", "").replace("\\n", "\n")
+    else:
+        long_output = os.getenv("NOTIFY_LONGHOSTOUTPUT", "").replace("\\n", "\n")
+    full_output = output + ("\n" + long_output if long_output else "")
+    
+    # Ticket key
+    ticket_key = get_ticket_key(hostname, service)
+    
+    # Check flapping
+    record_state_change(ticket_key, state)
+    is_flap, flap_msg = is_flapping(ticket_key)
+    
+    # Get existing ticket
+    ticket_id = get_ticket_id(ticket_key)
+
+    # === GRACE WINDOW: post-Effettuato 24h ===
+    # Quando un ticket e' in stato Effettuato, per le 24h successive:
+    #   - WARNING  -> scartato silenziosamente (nessun commento)
+    #   - CRITICAL -> riapertura con commento privato
+    if ticket_id and state not in ["OK", "UP"]:
+        # Se effettuato_at non e' ancora in cache, interroga Ydea per rilevare
+        # se l'operatore ha chiuso il ticket manualmente (senza OK da CheckMK)
+        if get_cache_field(ticket_key, 'effettuato_at') is None and \
+                get_cache_field(ticket_key, 'reopen_at') is None:
+            ydea_stato = fetch_ticket_stato(ticket_id)
+            debug(f"Ticket #{ticket_id} stato Ydea: {ydea_stato}")
+            if ydea_stato and ydea_stato.lower() in RESOLVED_STATES:
+                log(f"Ticket #{ticket_id} risulta '{ydea_stato}' su Ydea - setto effettuato_at")
+                set_cache_field(ticket_key, 'effettuato_at', int(time.time()))
+                set_cache_field(ticket_key, 'reopen_at', None)
+        grace = check_effettuato_grace(ticket_key)
+        if grace is False:
+            # Fuori 24h - ticket scaduto, rimuovi da cache
+            log(f"Ticket #{ticket_id} fuori finestra grace 24h (Effettuato) - rimozione cache")
+            remove_ticket_from_cache(ticket_key)
+            ticket_id = None
+        elif grace is True:
+            # Dentro finestra grace 24h
+            if state in ["WARNING", "WARN"]:
+                log(f"[GRACE] WARNING scartato: ticket #{ticket_id} in Effettuato (grace 24h)")
+                return 0
+            elif state in ["CRITICAL", "CRIT", "DOWN"]:
+                log(f"[GRACE] CRITICAL: riapertura ticket #{ticket_id} con commento privato")
+                grace_note = (
+                    f"[{datetime.now().strftime('%d/%m/%y %H:%M')}] *** RIAPERTURA ALERT ***\n"
+                    f"\n"
+                    f"Host: {hostname} ({real_ip})\n"
+                    f"Servizio: {service}\n"
+                    f"Stato: {last_state} → {state}\n"
+                    f"Output: {full_output}"
+                )
+                result = add_private_note(ticket_id, grace_note)
+                if result == 0:
+                    set_cache_field(ticket_key, 'reopen_at', int(time.time()))
+                    update_ticket_state(ticket_key, state)
+                    log_ticket_event("RIAPERTO", ticket_id, f"{hostname}/{service} {state}")
+                    log(f"Ticket #{ticket_id} riaperto con commento privato")
+                elif result == 2:
+                    log(f"Ticket #{ticket_id} not found (404), removing from cache")
+                    remove_ticket_from_cache(ticket_key)
+                    ticket_id = None
+                else:
+                    log(f"ERROR: aggiunta nota riapertura fallita su #{ticket_id}")
+                return 0
+    # === END GRACE WINDOW ===
+
+    if ticket_id:
+        # Update existing ticket
+        log(f"Updating existing ticket #{ticket_id}")
+
+        ts = datetime.now().strftime('%d/%m/%y %H:%M')
+        if state in ["OK", "UP"]:
+            header = f"[{ts}] ALLARME RIENTRATO"
+        elif flap_msg:
+            header = f"[{ts}] FLAPPING RILEVATO"
+        else:
+            header = f"[{ts}] AGGIORNAMENTO ALERT"
+
+        if what == "SERVICE":
+            subject_line = f"Servizio: {service}"
+        else:
+            subject_line = f"Host: {hostname} ({real_ip})"
+
+        note = (
+            f"{header}\n"
+            f"\n"
+            f"Host: {hostname} ({real_ip})\n"
+            f"{subject_line}\n"
+            f"Stato: {last_state} → {state}\n"
+            f"Output: {full_output}"
+        )
+        if flap_msg:
+            note += f"\nFlapping: {flap_msg}"
+        
+        result = add_private_note(ticket_id, note)
+        
+        if result == 0:
+            log(f"Private note added to ticket #{ticket_id}")
+            update_ticket_state(ticket_key, state)
+            
+            if state in ["OK", "UP"]:
+                if AGGREGATE_BY_HOST != 1 or RESOLVE_ON_SERVICE_OK == 1:
+                    mark_ticket_resolved(ticket_key)
+                    log(f"Ticket #{ticket_id} marked as resolved")
+        
+        elif result == 2:
+            # 404 - ticket deleted
+            log(f"Ticket #{ticket_id} not found (404), removing from cache")
+            remove_ticket_from_cache(ticket_key)
+            
+            # Create new ticket only if CRITICAL/DOWN (not WARNING)
+            if state in ["CRITICAL", "CRIT", "DOWN"]:
+                log("Creating new ticket after 404")
+                
+                alert_type = detect_alert_type(output, last_state, state)
+                alert_label = get_alert_label(alert_type, what, service)
+                
+                title = f"[{state} - {alert_label}] {hostname}"
+                if what == "SERVICE":
+                    title += f" - {service}"
+                
+                description = generate_smart_description(alert_type, hostname, real_ip,
+                                                        output, service, state, last_state,
+                                                        long_output)
+                description += f"\n\nTicket precedente #{ticket_id} chiuso da operatore.\n\nMarcatore: {build_cmk_marker(hostname, real_ip)}"
+                
+                new_ticket_id = create_ydea_ticket(title, description, "low", 
+                                                   YDEA_CATEGORY_ID, hostname, service, output)
+                
+                if new_ticket_id:
+                    log(f" New ticket created: #{new_ticket_id}")
+                    save_ticket_cache(ticket_key, new_ticket_id, state)
+                    log_ticket_event("CREATO", new_ticket_id, f"After 404 on #{ticket_id}")
+    
+    elif state in ["CRITICAL", "CRIT", "DOWN"]:
+        # Create new ticket (only CRITICAL/DOWN, WARNING only adds notes to existing tickets)
+        log(f"Creating new ticket for {hostname}/{service}")
+        
+        alert_type = detect_alert_type(output, last_state, state)
+        alert_label = get_alert_label(alert_type, what, service)
+        
+        title = f"[{state} - {alert_label}] {hostname}"
+        if what == "SERVICE":
+            title += f" - {service}"
+        
+        description = generate_smart_description(alert_type, hostname, real_ip,
+                                                output, service, state, last_state,
+                                                long_output)
+
+        ticket_id = create_ydea_ticket(title, description, "low",
+                                      YDEA_CATEGORY_ID, hostname, service, output)
+        
+        if ticket_id:
+            log(f" Ticket created: #{ticket_id}")
+            save_ticket_cache(ticket_key, ticket_id, state)
+            log_ticket_event("CREATO", ticket_id, f"{hostname}/{service} {state}")
+        else:
+            log(" Failed to create ticket")
+    
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        send_telegram_error(f"Unexpected exception in main: {e}")
+        sys.exit(1)

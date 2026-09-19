@@ -1,0 +1,11 @@
+[Unit]
+Description=CheckMK Job00 Daily Backup Timer
+Requires=checkmk-backup-job00.service
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

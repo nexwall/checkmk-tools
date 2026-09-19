@@ -1,0 +1,39 @@
+/* Nethesis brand override for Checkmk facelift theme */
+
+:root {
+  --color-state-success-background: #0369a1;
+  --ux-color-primary: #0369a1;
+}
+
+body.login {
+  background: linear-gradient(135deg, #1a425c 0%, #0369a1 100%) !important;
+}
+
+.login_window,
+.login div#login_window {
+  background: #ffffff !important;
+  border-radius: 8px !important;
+  box-shadow: 0 8px 32px rgba(26, 66, 92, 0.3) !important;
+}
+
+.login_window .login_title,
+#login_window .login_title {
+  display: none !important;
+}
+
+#header, .header, div#header { background: #1a425c !important; }
+#sidebar, .sidebar, div#sidebar { background: #1a425c !important; }
+#sidebar a:hover, .sidebar a:hover { background: #0369a1 !important; }
+.top_navbar, #top_navbar { background: #1a425c !important; }
+#page_menu_bar, .page_menu_bar { background: #1a425c !important; }
+.logo, #logo, .header_logo { background: transparent !important; }
+.title_line, div.title_line { border-bottom: 3px solid #0369a1 !important; }
+
+input.button, a.button, button.hot, .hot {
+  background: #0369a1 !important;
+  border-color: #024d80 !important;
+}
+input.button:hover, a.button:hover, button.hot:hover { background: #024d80 !important; }
+a { color: #0369a1 !important; }
+.selected, .active, li.active { border-left-color: #0369a1 !important; }
+.stateBOOLEAN_0, .stateOK { background-color: #0369a1 !important; }

@@ -1,0 +1,55 @@
+{
+  "comment": "Mapping tipologie allarme CheckMK -> campo 'tipo' Ydea",
+  "anagrafica_id": 2339268,
+  "anagrafica_nome": "AZIENDA MONITORATA test",
+  "priorita_id": 30,
+  "priorita_nome": "Bassa",
+  "fonte": "Partner portal",
+  "sla_id": 147,
+  "sla_nome": "Premium_Mon",
+  "assegnatoa_id": 12336,
+  "assegnatoa_nome": "Lorenzo Angelini",
+  "tipologie": {
+    "nethvoice": {
+      "nome": "Centrale Telefonica Nethvoice",
+      "tipo_ydea": "Centrale Telefonica Nethvoice",
+      "keywords": ["voip", "pbx", "telefon", "sip", "asterisk", "nethvoice", "cti"]
+    },
+    "nethsecurity": {
+      "nome": "Firewall UTM NethSecurity",
+      "tipo_ydea": "Firewall UTM Nethsecurity",
+      "keywords": ["firewall", "utm", "security", "vpn", "nethsecurity", "fw", "nsec", "nsec8", "fw-", "ns7"]
+    },
+    "nethservice": {
+      "nome": "Collaboration Suite Nethservice",
+      "tipo_ydea": "Collaboration Suite Nethservice",
+      "keywords": ["webtop", "mail", "email", "smtp", "imap", "webmail", "collaboration", "nethservice"]
+    },
+    "computer_client": {
+      "nome": "Computer Client",
+      "tipo_ydea": "Computer Client",
+      "keywords": ["workstation", "pc", "desktop", "laptop", "client", "windows", "nb", "notebook", "memory", "pagefile", "ram"]
+    },
+    "server": {
+      "nome": "Server",
+      "tipo_ydea": "Server",
+      "keywords": ["server", "srv", "database", "mysql", "postgres", "mariadb", "sql", "db"]
+    },
+    "networking": {
+      "nome": "Apparati di rete - Networking",
+      "tipo_ydea": "Apparati di rete - Networking",
+      "keywords": ["switch", "router", "network", "lan", "wan", "ethernet", "wifi", "wireless"]
+    },
+    "hypervisor": {
+      "nome": "Hypervisor",
+      "tipo_ydea": "Hypervisor",
+      "keywords": ["kvm", "proxmox", "vm", "virtual", "hypervisor", "qemu", "vmware", "esxi", "vcenter"]
+    },
+    "consulenza": {
+      "nome": "Consulenza tecnica specialistica",
+      "tipo_ydea": "Consulenza tecnica specialistica",
+      "keywords": ["consulenza", "supporto", "assistenza", "tecnica", "manual check", "richiesta"]
+    }
+  },
+  "default_tipo": "Server"
+}

@@ -1,0 +1,48 @@
+*.iso
+
+.vagrant/
+*.vhdx
+*.vmcx
+*.vmgs
+*.VMRS
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+
+# Personal preferences (not for public repo)
+.copilot-preferences.md
+
+# Backup directories (local only)
+BACKUP_ORIGINALI_PROD*/
+*.BACKUP_*/
+*BACKUP*_202*/
+BACKUP-CORRUPTED-*/
+BACKUP-CORRUPTED-*
+
+# Temporary reports
+integrity-report*.txt
+
+# Log files
+monitor-jobs.log
+notify-monitor.log
+
+
+# Ydea credentials (NEVER commit!)
+Ydea-Toolkit/config/credentials.sh
+Ydea-Toolkit/config/.ydea-cookies
+
+# Claude editor config (local only)
+.claude/
+
+# Backup artifacts
+*.bak
+
+# Private operational docs (do not commit)
+MACHINE_ACCESS_GUIDE.md
+
+# MCP config (local only)
+.mcp.json

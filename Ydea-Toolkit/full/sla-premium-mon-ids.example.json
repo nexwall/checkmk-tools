@@ -1,0 +1,73 @@
+{
+  "discovery_date": "2025-12-04 10:30:00",
+  "description": "ID per gestione ticket con SLA Premium_Mon - Cliente TK25/003209",
+  "macro_category": {
+    "id": 123,
+    "name": "Premium_Mon",
+    "description": "Categoria per clienti con contratto monitoraggio Premium"
+  },
+  "subcategories": [
+    {
+      "name": "Centrale telefonica NethVoice",
+      "id": 456,
+      "description": "Problemi telefonia VoIP"
+    },
+    {
+      "name": "Firewall UTM NethSecurity",
+      "id": 457,
+      "description": "Problemi firewall e sicurezza"
+    },
+    {
+      "name": "Collaboration Suite NethService",
+      "id": 458,
+      "description": "Problemi servizi collaborazione"
+    },
+    {
+      "name": "Computer client",
+      "id": 459,
+      "description": "Problemi workstation e client"
+    },
+    {
+      "name": "Server",
+      "id": 460,
+      "description": "Problemi server fisici e virtuali"
+    },
+    {
+      "name": "Apparati di rete - Networking",
+      "id": 461,
+      "description": "Problemi switch, router, networking"
+    },
+    {
+      "name": "Hypervisor",
+      "id": 462,
+      "description": "Problemi piattaforme virtualizzazione"
+    },
+    {
+      "name": "Consulenza tecnica specialistica",
+      "id": 463,
+      "description": "Richieste consulenza tecnica"
+    }
+  ],
+  "sla": {
+    "id": 789,
+    "name": "TK25/003209 SLA Personalizzata",
+    "description": "SLA personalizzata per contratto monitoraggio"
+  },
+  "low_priority": {
+    "id": 1,
+    "name": "Bassa",
+    "description": "Priorità bassa per alert automatici monitoraggio"
+  },
+  "usage_notes": {
+    "mapping_logic": "Mappare il tipo di servizio CheckMK alla sottocategoria appropriata",
+    "examples": {
+      "ns7_host": "Server",
+      "ns8_host": "Server",
+      "nsec8_host": "Firewall UTM NethSecurity",
+      "nethvoice_service": "Centrale telefonica NethVoice",
+      "proxmox_host": "Hypervisor",
+      "windows_host": "Computer client o Server (in base al ruolo)",
+      "network_device": "Apparati di rete - Networking"
+    }
+  }
+}

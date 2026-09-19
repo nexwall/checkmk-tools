@@ -1,0 +1,4 @@
+# Python cache artifacts (local)
+__pycache__/
+*.pyc
+*.pyo

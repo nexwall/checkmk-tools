@@ -1,0 +1,36 @@
+========================================================================================
+DETAILED TMATE SERVER SCRIPT LIST
+Repository: checkmk-tools
+Folder: script-check-tmate-server/
+Date: April 5, 2026
+========================================================================================
+
+ FOLDER STRUCTURE
+└── full/ (2 scripts)
+
+========================================================================================
+CHECK SCRIPTS (full/)
+========================================================================================
+
+check_tmate_server.py
+  - Description : Show all connected tmate clients with SSH token and viewer status
+  - Service name: Tmate.Clients
+  - States      : OK (clients connected, no viewer), WARN (viewer connected), CRIT (no clients)
+  - Details     : Reads /opt/tmate-tokens/*.txt, checks active daemon processes,
+                  uses journalctl --since "3 hours ago" to track viewer events
+  - Deploy on   : tmate-ssh-server host (vps-02 / monitor01)
+
+tmate-cleanup-stale.py
+  - Description : Kill orphaned tmate-ssh-server daemon processes
+  - Type        : Maintenance script (NOT a CheckMK local check)
+  - Details     : Compares active daemon prefixes against /opt/tmate-tokens/*.txt,
+                  kills daemons with no matching active token (grace period: 5 min)
+  - Log file    : /var/log/tmate-cleanup.log
+  - Deploy on   : tmate-ssh-server host as systemd timer (every 5 min)
+  - Install     : /usr/local/bin/tmate-cleanup-stale.py
+                  /etc/systemd/system/tmate-cleanup.service
+                  /etc/systemd/system/tmate-cleanup.timer
+
+NOTE: check_tmate_watchdog.py removed on 2026-04-05 - too heavy for single-core VPS
+      (journald parsing caused 28%+ CPU per cycle). Orphan detection now handled
+      by tmate-cleanup-stale.py which runs as a separate timer, not a check.

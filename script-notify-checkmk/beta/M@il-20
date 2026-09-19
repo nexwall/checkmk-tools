@@ -1,0 +1,1837 @@
+#!/usr/bin/env python3
+# M@il-20
+# Bulk: yes
+# M@il-20 is a beta Checkmk HTML notification handler with a
+# per-host per-category cooldown and a fail2ban-style transition rate
+# limiter with adaptive learning for HOST STATE and SERVICE STATE
+# PING notifications.
+#
+# Cooldown (default): after a successful delivery for a host+category,
+#                      subsequent notifications for the same pair are
+#                      suppressed for cooldown_seconds.
+#
+# Version: 1.4.0-beta
+
+import os
+import sys
+import json
+import time
+import fcntl
+import shutil
+import math
+import logging
+import tempfile
+import argparse
+import subprocess
+import uuid as _uuid
+import re as _re
+from pathlib import Path
+from urllib.parse import quote
+
+SCRIPT_NAME = "M@il-20"
+SCRIPT_DESCRIPTION = (
+    "M@il-20 is a beta Checkmk HTML notification handler with a "
+    "per-host per-category cooldown and a fail2ban-style transition "
+    "rate limiter with adaptive learning for HOST STATE and SERVICE "
+    "STATE PING notifications."
+)
+VERSION = "1.4.0-beta"
+
+# ---------------------------------------------------------------------------
+# Cooldown candidate values for adaptive recommendation
+# ---------------------------------------------------------------------------
+_COOLDOWN_CANDIDATES = [1800, 3600, 7200, 10800, 21600]
+
+# ---------------------------------------------------------------------------
+# Configuration — defaults (overridden by config file values)
+# ---------------------------------------------------------------------------
+CONFIG = {
+    "mode": "audit",
+    "host_state": {
+        "enabled": True,
+        "observation_window": 1800,
+        "trigger_transitions": 4,
+        "suppression_time": 3600,
+    },
+    "service_state_ping": {
+        "enabled": True,
+        "observation_window": 1800,
+        "trigger_transitions": 6,
+        "suppression_time": 3600,
+    },
+    "adaptive": {
+        "enabled": True,
+        "mode": "learning",
+        "minimum_learning_days": 14,
+        "minimum_transition_samples": 20,
+        "recalculate_every_hours": 24,
+        "percentile": 95,
+        "safety_margin": 2,
+        "auto_apply": False,
+        "cooldown": {
+            "enabled": True,
+            "auto_apply": True,
+            "minimum_learning_days": 3,
+            "minimum_notification_samples": 20,
+            "minimum_expected_reduction_percent": 30,
+            "candidate_cooldowns": [7200, 10800, 21600],
+        },
+    },
+    "cooldown": {
+        "enabled": True,
+        "mode": "audit",
+        "default_seconds": 3600,
+        "per_category": {
+            "host_state": 3600,
+            "service_state_ping": 3600,
+        },
+        "preserve_recovery": True,
+    },
+    "state_retention": {
+        "stale_host_days": 30,
+        "max_transitions_per_category": 500,
+        "cleanup_interval_seconds": 3600,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+OMD_ROOT = os.environ.get("OMD_ROOT", "")
+STATE_DIR = os.environ.get(
+    "NOTIFY_RATE_LIMIT_STATE_DIR",
+    os.path.join(OMD_ROOT, "var", "check_mk", "M@il-20"),
+)
+LOG_DIR = os.environ.get(
+    "NOTIFY_RATE_LIMIT_LOG_DIR",
+    os.path.join(OMD_ROOT, "var", "log", "notifications"),
+)
+_HERE = Path(__file__).resolve().parent
+CONFIG_PATH = str(_HERE / "M@il-20-config.json")
+
+CONFIG_PATH = os.environ.get(
+    "NOTIFY_RATE_LIMIT_CONFIG",
+    CONFIG_PATH,
+)
+
+# ---------------------------------------------------------------------------
+# Mail constants (M@il compatible)
+# ---------------------------------------------------------------------------
+CMK_URL = os.environ.get("CMK_URL", "https://<your-checkmk-server>/monitoring")
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "checkmk@example.com")
+
+
+# ---------------------------------------------------------------------------
+# Safe handler — never raises into business logic
+# ---------------------------------------------------------------------------
+
+class _SafeFileHandler(logging.FileHandler):
+    """FileHandler that never raises on emit().
+
+    Defense-in-depth: catches every emit() exception so no LOG call
+    can ever propagate into business logic.  Falls back to stderr.
+    """
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except Exception:
+            try:
+                sys.stderr.write("%s: log write failed\n" % SCRIPT_NAME)
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+def setup_logger():
+    """Configure a file logger under the Checkmk site log area.
+
+    Best-effort: falls back to stderr if the log directory or file
+    cannot be created.
+    """
+    log = logging.getLogger(SCRIPT_NAME)
+    log.setLevel(logging.DEBUG)
+    log.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    handler = None
+    try:
+        if LOG_DIR:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            log_path = os.path.join(LOG_DIR, "mail-20.log")
+            handler = _SafeFileHandler(log_path)
+    except Exception as exc:
+        if os.environ.get("MAIL20_DEBUG") == "1":
+            sys.stderr.write(f"{SCRIPT_NAME}: log init: {exc}\n")
+
+    if handler is None:
+        handler = logging.StreamHandler(sys.stderr)
+
+    handler.setFormatter(fmt)
+    log.addHandler(handler)
+    return log
+
+
+LOG = setup_logger()
+
+# ---------------------------------------------------------------------------
+# Sanitization and safe logging helpers
+# ---------------------------------------------------------------------------
+
+# Known secret environment variable values to redact from all logged output
+_KNOWN_SECRET_ENV_VARS = ["TELEGRAM_TOKEN", "SMTP_PASSWORD", "API_KEY"]
+_SECRET_VALUES_CACHE = None
+
+
+def _load_secret_values():
+    """Cache known secret values from environment variables."""
+    global _SECRET_VALUES_CACHE
+    if _SECRET_VALUES_CACHE is not None:
+        return _SECRET_VALUES_CACHE
+    secrets = []
+    for var in _KNOWN_SECRET_ENV_VARS:
+        val = os.environ.get(var, "")
+        if val:
+            secrets.append(val)
+    _SECRET_VALUES_CACHE = secrets
+    return secrets
+
+
+_SANITIZE_REGEX = [
+    (_re.compile(r'/bot[A-Za-z0-9_:.-]+/'), "/bot[REDACTED]/"),
+    (_re.compile(r'(Bearer\s+)[A-Za-z0-9._~+/=-]+', _re.IGNORECASE), r'\1[REDACTED]'),
+    (_re.compile(r'((?:[?&])(?:token|key|secret|password|api_key|apiKey)=)[^&\s]+', _re.IGNORECASE), r'\1[REDACTED]'),
+    (_re.compile(r'(Authorization:\s*)[^\r\n]+', _re.IGNORECASE), r'\1[REDACTED]'),
+]
+
+
+def _sanitize_text(text):
+    """Redact known secrets and sensitive patterns from a string.
+
+    Safe to call with any string — never raises.
+    """
+    if not isinstance(text, str):
+        return str(text) if text is not None else ""
+    try:
+        for env_val in _load_secret_values():
+            if env_val and env_val in text:
+                text = text.replace(env_val, "[REDACTED]")
+        for pattern, replacement in _SANITIZE_REGEX:
+            text = pattern.sub(replacement, text)
+    except Exception:
+        pass
+    return text
+
+
+def _safe_log(level, record):
+    """Emit a structured JSON Lines log record.
+
+    Best-effort — never raises, never blocks delivery.
+    Falls back to a single sanitized stderr line on failure.
+    """
+    try:
+        record["level"] = level
+        # Sanitize all writable string fields in-place
+        for k in list(record.keys()):
+            v = record[k]
+            if isinstance(v, str):
+                record[k] = _sanitize_text(v)
+            elif isinstance(v, dict):
+                for k2 in list(v.keys()):
+                    if isinstance(v[k2], str):
+                        v[k2] = _sanitize_text(v[k2])
+        line = "NOTIFY_EVENT " + json.dumps(record, default=str, ensure_ascii=False)
+        if level == "ERROR":
+            LOG.error("%s", line)
+        elif level == "WARNING":
+            LOG.warning("%s", line)
+        else:
+            LOG.info("%s", line)
+    except Exception:
+        try:
+            sys.stderr.write("%s: log failure\n" % SCRIPT_NAME)
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+
+def _debug_enabled():
+    """Check whether debug logging is enabled via environment variable."""
+    return os.environ.get("MAIL20_DEBUG") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Configuration loading
+# ---------------------------------------------------------------------------
+
+def _deep_merge(base, overlay):
+    """Recursively merge overlay into base, preserving base defaults."""
+    for key, val in overlay.items():
+        if key in base and isinstance(base[key], dict) and isinstance(val, dict):
+            _deep_merge(base[key], val)
+        else:
+            base[key] = val
+
+
+def load_config():
+    """Load configuration from JSON file, falling back to defaults.
+
+    Returns a dict with the same top-level keys as CONFIG.
+    """
+    cfg = json.loads(json.dumps(CONFIG))
+    path = Path(CONFIG_PATH)
+    if not path.is_file():
+        LOG.debug("Config file %s not found — using defaults", CONFIG_PATH)
+        return cfg
+
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            LOG.warning("Config file %s: root is not a dict — using defaults", CONFIG_PATH)
+            return cfg
+        _deep_merge(cfg, data)
+
+        # Validate adaptive mode
+        adaptive = cfg.get("adaptive", {})
+        if adaptive.get("mode") not in ("learning", None):
+            LOG.warning("Unsupported adaptive.mode=%r — forcing learning", adaptive.get("mode"))
+            adaptive["mode"] = "learning"
+        if adaptive.get("auto_apply", False):
+            LOG.warning("adaptive.auto_apply=true is not supported — forcing false")
+            adaptive["auto_apply"] = False
+        if cfg.get("mode") != "audit":
+            LOG.warning("mode=%s is not supported — forcing audit", cfg.get("mode"))
+            cfg["mode"] = "audit"
+
+        LOG.info("Configuration loaded from %s", CONFIG_PATH)
+    except (json.JSONDecodeError, OSError) as exc:
+        LOG.warning("Cannot load config %s: %s — using defaults", CONFIG_PATH, exc)
+
+    return cfg
+
+
+CFG = load_config()
+
+
+# ---------------------------------------------------------------------------
+# M@il-compatible mail delivery
+# ---------------------------------------------------------------------------
+
+def get_color(state):
+    """Return an HTML colour for a state label."""
+    s = state.upper()
+    if s in ("OK", "UP"):
+        return "#13d389"
+    if s in ("WARNING", "WARN"):
+        return "#ffd700"
+    if s in ("CRITICAL", "CRIT", "DOWN"):
+        return "#ff5151"
+    return "#ff9800"
+
+
+def get_label(state):
+    """Return an abbreviated state label."""
+    s = state.upper()
+    if s == "WARNING":
+        return "WARN"
+    if s == "CRITICAL":
+        return "CRIT"
+    if s == "UNKNOWN":
+        return "UNKN"
+    return s
+
+
+def build_email_content(to_email, hostname, service, old_state, new_state,
+                        output, long_output, host_address, real_ip, frp,
+                        site, date):
+    """Build a complete MIME-HTML email matching the M@il format."""
+    safe_output = output
+    safe_long = long_output
+    if host_address and host_address != real_ip:
+        safe_output = safe_output.replace(host_address, real_ip)
+        safe_long = safe_long.replace(host_address, real_ip)
+
+    full_output = safe_output
+    if safe_long:
+        full_output += "<br>" + safe_long.replace("\n", "<br>")
+
+    old_color = get_color(old_state)
+    new_color = get_color(new_state)
+    old_label = get_label(old_state)
+    new_label = get_label(new_state)
+
+    frp_row = ""
+    if frp == "yes":
+        frp_row = (
+            '<tr><td>FRP Tunnel:</td><td>'
+            '<span style="color:#00d4aa;font-weight:600"> Active</span>'
+            f' (Real IP: {real_ip})</td></tr>'
+        )
+
+    cmk_url = CMK_URL.rstrip("/")
+    h_enc = quote(hostname)
+    srv_enc = quote(service)
+
+    is_host_check = (service in ("Host Check", ""))
+    if is_host_check:
+        srv_link = f"{cmk_url}/check_mk/view.py?view_name=host&host={h_enc}"
+    else:
+        srv_link = f"{cmk_url}/check_mk/view.py?view_name=service&host={h_enc}&service={srv_enc}"
+
+    host_link = f"{cmk_url}/check_mk/view.py?view_name=host&host={h_enc}"
+    output_summary = safe_output.replace("\n", "<br>")
+
+    subject = f"Checkmk: {hostname}"
+    if not is_host_check:
+        subject += f"/{service}"
+    subject += f" {new_label}"
+
+    email = (
+        f"To: {to_email}\n"
+        f"From: {FROM_EMAIL}\n"
+        f"Subject: {subject}\n"
+        "Content-Type: text/html; charset=UTF-8\n"
+        "MIME Version: 1.0\n"
+        "\n"
+        "<!DOCTYPE html>\n"
+        '<html><head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        "<style>"
+        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,"
+        "sans-serif;background:#f5f5f5;margin:0;padding:20px}"
+        ".container{max-width:650px;margin:0 auto;background:#fff;"
+        "border-radius:8px;overflow:hidden;box-shadow:0 2px 8px "
+        "rgba(0,0,0,.1);border:2px solid #e0e0e0}"
+        ".header{background:#f8f9fa;padding:20px;display:flex;"
+        "align-items:center;gap:10px;border-bottom:2px solid #d0d0d0}"
+        ".logo-icon{width:24px;height:24px;background:#00d4aa;"
+        "border-radius:4px;color:#fff;display:flex;align-items:center;"
+        "justify-content:center;font-weight:bold;font-size:14px}"
+        ".logo-text{color:#00d4aa;font-size:18px;font-weight:600}"
+        ".status-bar{background:linear-gradient(90deg,"
+        f"{old_color} 0%,{old_color} 48%,#666 48%,#666 52%,"
+        f"{new_color} 52%,{new_color} 100%);"
+        "height:6px;border-bottom:1px solid rgba(0,0,0,.15)}"
+        ".content{padding:30px}"
+        ".event-row{background:#f8f9fa;padding:15px 20px;border-radius:6px;"
+        "margin-bottom:20px;display:flex;justify-content:space-between;"
+        "align-items:center;flex-wrap:wrap;gap:10px;border:1px solid #e0e0e0}"
+        ".event-label{color:#666;font-size:14px;font-weight:500}"
+        ".event-value{color:#333;font-size:14px;word-break:break-word}"
+        ".state-badge{padding:6px 14px;border-radius:4px;font-weight:600;"
+        "font-size:13px;color:#fff;background-color:"
+        f"{new_color};white-space:nowrap}}"
+        ".section-title{color:#999;font-size:18px;font-weight:600;"
+        "margin:20px 0 15px}"
+        ".info-table{width:100%;border-collapse:collapse;margin-bottom:25px}"
+        ".info-table td{padding:10px 0;border-bottom:1px solid #e0e0e0;"
+        "word-break:break-word}"
+        ".info-table td:first-child{color:#333;font-weight:600;width:140px}"
+        ".info-table td:last-child{color:#666}"
+        ".service-details{background:linear-gradient(135deg,#fafafa 0%,"
+        "#f5f5f5 100%);padding:20px;border-radius:8px;border:1px solid "
+        f"{new_color};border-left:6px solid {new_color};"
+        "margin-top:15px;overflow-x:auto;box-shadow:0 2px 4px "
+        "rgba(0,0,0,.05)}"
+        ".service-details pre{margin:0;white-space:pre-wrap;word-wrap:break-word;"
+        "font-family:'Courier New',monospace;font-size:13px;color:#333;"
+        "line-height:1.6}"
+        ".footer{background:#f8f8f8;padding:20px;text-align:center;"
+        "color:#666;font-size:13px}"
+        ".buttons{margin-top:15px;display:flex;gap:10px;"
+        "justify-content:center;flex-wrap:wrap}"
+        ".btn{display:inline-block;padding:12px 24px;"
+        f"background:{new_color};color:#fff;text-decoration:none;"
+        "border-radius:4px;font-weight:600;font-size:14px;min-width:120px;"
+        "border:2px solid #000;transition:filter 0.2s}"
+        ".btn:hover{filter:brightness(0.85)}"
+        "</style></head><body>"
+        '<div class="container">'
+        '<div class="header"><div class="logo-icon">C</div>'
+        '<span class="logo-text">checkmk</span></div>'
+        '<div class="status-bar"></div>'
+        '<div class="content">'
+        '<div class="event-row">'
+        '<span class="event-label">Event:</span>'
+        '<div><span class="state-badge" style="background:'
+        f"{old_color}\">{old_label}</span>"
+        f' → <span class="state-badge">{new_label}</span></div></div>'
+        '<div class="event-row">'
+        f'<span class="event-label">Service:</span>'
+        f'<span class="event-value">{service}</span></div>'
+        '<div class="event-row">'
+        f'<span class="event-label">Host:</span>'
+        f'<span class="event-value">{hostname}</span></div>'
+        '<h2 class="section-title">Event overview</h2>'
+        '<table class="info-table">'
+        f"<tr><td>Event date:</td><td>{date}</td></tr>"
+        f"<tr><td>Address:</td><td>{real_ip}</td></tr>"
+        f"{frp_row}"
+        f"<tr><td>Site:</td><td>{site}</td></tr>"
+        f"<tr><td>Summary:</td><td>{output_summary}</td></tr>"
+        "</table>"
+        '<h2 class="section-title">Service details:</h2>'
+        '<div class="service-details">'
+        f"<pre>{full_output}</pre></div></div>"
+        '<div class="footer">Sent by Checkmk'
+        '<div class="buttons">'
+        f'<a href="{srv_link}" class="btn">Service</a>'
+        f'<a href="{host_link}" class="btn">Host</a>'
+        "</div></div></div></body></html>"
+    )
+    return email
+
+
+def send_email(email_content):
+    """Deliver an email via /usr/sbin/sendmail.
+
+    Returns an exit code suitable for Checkmk (0 = success).
+    """
+    try:
+        proc = subprocess.run(
+            ["/usr/sbin/sendmail", "-t"],
+            input=email_content.encode("utf-8"),
+            timeout=30,
+        )
+        return proc.returncode
+    except subprocess.TimeoutExpired:
+        LOG.error("sendmail timeout")
+        return 1
+    except FileNotFoundError:
+        LOG.error("sendmail not found")
+        return 1
+    except Exception as exc:
+        LOG.error("sendmail error: %s", exc)
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit state management
+# ---------------------------------------------------------------------------
+
+STATE_SCHEMA_VERSION = 3
+
+
+def get_state_path():
+    """Return the path to the shared state file."""
+    path = Path(STATE_DIR)
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "state.json"
+
+
+_STATE_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB safety threshold
+
+
+def read_state(state_path):
+    """Read the JSON state file, returning an empty dict on failure.
+
+    Guards against oversized files: if the file exceeds the safety
+    threshold, a warning is logged and normal loading is still
+    attempted.  If parsing fails, an empty dict is returned.
+    """
+    try:
+        size = state_path.stat().st_size
+        if size > _STATE_SIZE_LIMIT:
+            LOG.warning(
+                "State file %s is %d bytes — exceeds %d byte limit. "
+                "Attempting to load anyway.",
+                state_path, size, _STATE_SIZE_LIMIT,
+            )
+    except OSError:
+        pass
+    try:
+        raw = state_path.read_bytes()
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+        LOG.warning("State file %s is not a dict — resetting", state_path)
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        LOG.debug("Cannot read state %s: %s — starting fresh", state_path, exc)
+    return {}
+
+
+def write_state(state_path, state):
+    """Atomically write the JSON state file using a temp file + rename."""
+    tmp = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(state_path.parent),
+            prefix=".state_tmp_",
+        )
+        os.close(fd)
+        tmp = Path(tmp_name)
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+        tmp.chmod(0o640)
+        os.replace(str(tmp), str(state_path))
+    except Exception as exc:
+        LOG.error("Cannot write state file %s: %s", state_path, exc)
+        if tmp and tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+def get_lock_path(state_path):
+    """Return the flock-based lock file path (next to the state file)."""
+    return state_path.parent / "state.lock"
+
+
+class StateLock:
+    """Context manager for exclusive access to the state file."""
+
+    def __init__(self, lock_path):
+        self._lock_path = lock_path
+        self._fd = None
+
+    def __enter__(self):
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = self._lock_path.open("w")
+        fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._fd:
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+            self._fd.close()
+            self._fd = None
+        self._lock_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# State schema migration
+# ---------------------------------------------------------------------------
+
+def migrate_state(state):
+    """Upgrade state to the current schema version.
+
+    Handles migration:
+      v1 → v2: add adaptive learning section per host
+      v2 → v3: add cooldown tracking structure (last_delivered + samples)
+
+    Preserves all existing counters.  Fail-safe: never raises.
+    """
+    sv = state.get("schema_version", 1)
+
+    if sv >= STATE_SCHEMA_VERSION:
+        return state
+
+    if sv == 1:
+        # v1 → v2: add adaptive learning section per host
+        for hostname, rec in list(state.items()):
+            if hostname == "schema_version":
+                continue
+            if not isinstance(rec, dict):
+                continue
+            for cat in ("host_state", "service_state_ping"):
+                cat_rec = rec.get(cat)
+                if isinstance(cat_rec, dict):
+                    if "adaptive" not in cat_rec:
+                        cat_rec["adaptive"] = _fresh_learning_record()
+        state["schema_version"] = 2
+        LOG.info("State schema migrated v1 → v2")
+
+    if sv == 2:
+        # v2 → v3: add cooldown tracking structure
+        if "cooldown" not in state:
+            state["cooldown"] = {
+                "last_delivered": {},
+                "samples": {},
+            }
+        for cat in ("host_state", "service_state_ping"):
+            if cat not in state["cooldown"]["last_delivered"]:
+                state["cooldown"]["last_delivered"][cat] = {}
+            if cat not in state["cooldown"]["samples"]:
+                state["cooldown"]["samples"][cat] = []
+        # Migrate last_delivery_ts from per-category records if present
+        for hostname, rec in list(state.items()):
+            if hostname.startswith("_") or not isinstance(rec, dict):
+                continue
+            for cat in ("host_state", "service_state_ping"):
+                cat_rec = rec.get(cat)
+                if isinstance(cat_rec, dict):
+                    ldt = cat_rec.pop("last_delivery_ts", 0)
+                    if ldt:
+                        state["cooldown"]["last_delivered"][cat][hostname] = ldt
+        state["schema_version"] = 3
+        LOG.info("State schema migrated v2 → v3 (cooldown tracking)")
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Transition tracking
+# ---------------------------------------------------------------------------
+
+def now():
+    """Return current Unix time."""
+    return int(time.time())
+
+
+def classify_notification():
+    """Read Checkmk environment variables and classify the event."""
+    to_email = os.environ.get("NOTIFY_CONTACTEMAIL", "root@localhost")
+    hostname = os.environ.get("NOTIFY_HOSTNAME", "Unknown")
+    site = os.environ.get("NOTIFY_OMD_SITE", "monitoring")
+    date = os.environ.get("NOTIFY_SHORTDATETIME", "")
+    host_address = os.environ.get("NOTIFY_HOSTADDRESS", "N/A")
+    real_ip = os.environ.get("NOTIFY_HOSTLABEL_real_ip", host_address)
+    frp = os.environ.get("NOTIFY_HOSTLABEL_frp_tunnel", "no")
+    output = os.environ.get("NOTIFY_HOSTOUTPUT", "N/A")
+    long_output = os.environ.get("NOTIFY_LONGHOSTOUTPUT", "")
+    service_desc = os.environ.get("NOTIFY_SERVICEDESC", "")
+
+    is_service = bool(service_desc) and not service_desc.startswith("$")
+
+    if is_service:
+        old_state = (
+            os.environ.get("NOTIFY_PREVIOUSSERVICEHARDSHORTSTATE")
+            or os.environ.get("NOTIFY_LASTSERVICESTATE", "OK")
+        )
+        new_state = (
+            os.environ.get("NOTIFY_SERVICESHORTSTATE")
+            or os.environ.get("NOTIFY_SERVICESTATE", "UNKNOWN")
+        )
+        output = os.environ.get("NOTIFY_SERVICEOUTPUT", "N/A")
+        long_output = os.environ.get("NOTIFY_LONGSERVICEOUTPUT", "")
+    else:
+        old_state = (
+            os.environ.get("NOTIFY_PREVIOUSHOSTHARDSHORTSTATE")
+            or os.environ.get("NOTIFY_LASTHOSTSTATE", "UP")
+        )
+        new_state = (
+            os.environ.get("NOTIFY_HOSTSHORTSTATE")
+            or os.environ.get("NOTIFY_HOSTSTATE", "DOWN")
+        )
+
+    return {
+        "is_host": not is_service,
+        "hostname": hostname,
+        "service_desc": service_desc,
+        "old_state": old_state.upper(),
+        "new_state": new_state.upper(),
+        "output": output,
+        "long_output": long_output,
+        "host_address": host_address,
+        "real_ip": real_ip,
+        "frp": frp,
+        "site": site,
+        "date": date,
+        "to_email": to_email,
+    }
+
+
+def is_supported_transition(event):
+    """Determine whether the event is a tracked transition type.
+
+    Returns (category, is_transition).
+    """
+    if event["is_host"]:
+        valid_pairs = {("UP", "DOWN"), ("DOWN", "UP")}
+        pair = (event["old_state"], event["new_state"])
+        if pair in valid_pairs:
+            return "host_state", True
+        return "host_state", False
+    else:
+        if event["service_desc"] != "PING":
+            return None, False
+        valid_pairs = {("OK", "CRIT"), ("CRIT", "OK"),
+                       ("OK", "CRITICAL"), ("CRITICAL", "OK")}
+        pair = (event["old_state"], event["new_state"])
+        if pair in valid_pairs:
+            return "service_state_ping", True
+        if event["new_state"] in ("WARNING", "WARN", "UNKNOWN", "UNKN"):
+            LOG.info("%s/%s PING state %s → %s — not counted",
+                     event["hostname"], event["service_desc"],
+                     event["old_state"], event["new_state"])
+            return "service_state_ping", False
+        return "service_state_ping", False
+
+
+def make_category_record():
+    """Return a fresh per-category state record."""
+    return {
+        "last_state": None,
+        "transitions": [],
+        "suppression_until": 0,
+        "suppressed_count": 0,
+    }
+
+
+def get_host_state(state, hostname):
+    """Return the per-host state dict, creating it if absent."""
+    if hostname not in state:
+        state[hostname] = {
+            "host_state": make_category_record(),
+            "service_state_ping": make_category_record(),
+        }
+    return state[hostname]
+
+
+def prune_transitions(transitions, window):
+    """Remove transition timestamps older than `window` seconds ago."""
+    cutoff = now() - window
+    return [t for t in transitions if t >= cutoff]
+
+
+def evaluate_rate_limit(event):
+    """Evaluate the rate-limit decision for one notification event.
+
+    Returns a decision dict.  Fail-open: any unexpected exception sends
+    the mail normally.
+    """
+    state_path = get_state_path()
+    lock_path = get_lock_path(state_path)
+    category, is_transition = is_supported_transition(event)
+
+    if category is None:
+        return {
+            "decision": "BYPASS",
+            "category": None,
+            "reason": "Not a tracked notification type",
+        }
+
+    cfg_section = CFG.get(category, {})
+    enabled = cfg_section.get("enabled", True)
+    window = cfg_section.get("observation_window", 1800)
+    trigger = cfg_section.get("trigger_transitions", 4)
+    suppress_time = cfg_section.get("suppression_time", 3600)
+
+    if not enabled:
+        return {
+            "decision": "BYPASS",
+            "category": category,
+            "reason": f"{category} rate-limiting disabled",
+        }
+
+    try:
+        with StateLock(lock_path):
+            state = read_state(state_path)
+            state = migrate_state(state)
+            host_rec = get_host_state(state, event["hostname"])
+            cat_rec = host_rec[category]
+
+            last_state = cat_rec.get("last_state")
+            transitions = cat_rec.get("transitions", [])
+            suppression_until = cat_rec.get("suppression_until", 0)
+            suppressed_count = cat_rec.get("suppressed_count", 0)
+
+            # Real transition only when state differs from last recorded
+            if is_transition and last_state is not None:
+                if event["new_state"] == last_state:
+                    is_transition = False
+
+            ts = now()
+            cat_rec["last_state"] = event["new_state"]
+
+            decision = "SEND"
+            reason = "Normal notification"
+
+            if suppression_until > ts:
+                if is_transition:
+                    suppressed_count += 1
+                    cat_rec["suppressed_count"] = suppressed_count
+
+                mode = CFG.get("mode", "audit")
+                if mode == "enforce":
+                    decision = "SUPPRESS"
+                    reason = (
+                        f"Suppression active until "
+                        f"{suppression_until} "
+                        f"(transition #{suppressed_count} suppressed)"
+                    )
+                else:
+                    decision = "WOULD_SUPPRESS"
+                    reason = (
+                        f"Audit mode — would suppress (active until "
+                        f"{suppression_until}, "
+                        f"transition #{suppressed_count} counted)"
+                    )
+            else:
+                if is_transition:
+                    transitions.append(ts)
+                    transitions = prune_transitions(transitions, window)
+                    count = len(transitions)
+
+                    # Threshold is inclusive: transitions >= trigger
+                    # triggers suppression entry.
+                    if count >= trigger:
+                        suppression_until = ts + suppress_time
+                        suppressed_count = 0
+                        cat_rec["suppression_until"] = suppression_until
+                        cat_rec["suppressed_count"] = 0
+
+                        mode = CFG.get("mode", "audit")
+                        if mode == "enforce":
+                            decision = "SEND"
+                            reason = (
+                                f"Suppression entered "
+                                f"(transition #{count}/{trigger} "
+                                f"in {window}s)"
+                            )
+                            LOG.info(
+                                "%s/%s %s suppression started — "
+                                "%d transitions in %ds, "
+                                "ban until %d",
+                                event["hostname"], category, category,
+                                count, window, suppression_until,
+                            )
+                        else:
+                            decision = "SEND"
+                            reason = (
+                                f"Audit — threshold reached "
+                                f"({count}/{trigger}) — "
+                                f"would suppress next, "
+                                f"suppression_until={suppression_until}"
+                            )
+                            LOG.info(
+                                "%s/%s %s threshold reached "
+                                "(audit mode) — %d transitions in %ds",
+                                event["hostname"], category, category,
+                                count, window,
+                            )
+                    else:
+                        decision = "SEND"
+                        reason = (
+                            f"Transition #{count}/{trigger} "
+                            f"in {window}s"
+                        )
+                else:
+                    decision = "SEND"
+                    reason = (
+                        f"State {event['old_state']} → "
+                        f"{event['new_state']} — no transition counted"
+                    )
+
+            cat_rec["transitions"] = transitions
+            cat_rec["suppression_until"] = suppression_until
+            cat_rec["suppressed_count"] = suppressed_count
+
+            # --- Adaptive transition learning update ---
+            _update_adaptive(cat_rec, category, is_transition, ts)
+
+            # --- Cooldown evaluation (after transition limiter) ---
+            cd_decision, cd_reason = _evaluate_cooldown(state, event, category, ts)
+
+            # Safe combine: transition enforce suppression can never be overridden.
+            # Cooldown can only add suppression, never remove it.
+            if decision == "SUPPRESS":
+                # Transition enforce suppression — keep it, cooldown cannot override
+                pass
+            elif cd_decision == "SUPPRESSED_COOLDOWN":
+                # Cooldown enforce suppression — overrides transition's SEND/WOULD_SUPPRESS
+                decision = cd_decision
+                reason = cd_reason
+            elif cd_decision == "WOULD_SUPPRESS_COOLDOWN" and decision == "SEND":
+                # Cooldown audit — only overrides transition's SEND
+                decision = cd_decision
+                reason = cd_reason
+            elif cd_decision == "COOLDOWN_BYPASS_RECOVERY":
+                _safe_log("INFO", {
+                    "status": "COOLDOWN_BYPASS_RECOVERY",
+                    "host": event["hostname"],
+                    "category": category,
+                    "old_state": event["old_state"],
+                    "new_state": event["new_state"],
+                    "reason": cd_reason,
+                })
+
+            # --- Cooldown adaptive sample collection ---
+            was_delivered = decision not in ("SUPPRESS", "SUPPRESSED_COOLDOWN",
+                                              "WOULD_SUPPRESS", "WOULD_SUPPRESS_COOLDOWN")
+            _update_cooldown_adaptive(state, event, category, ts, was_delivered)
+
+            # --- Cooldown adaptive recommendation (rate-limited) ---
+            ad_cooldown = CFG.get("adaptive", {}).get("cooldown", {})
+            if ad_cooldown.get("enabled", True):
+                cd_samples = state.get("cooldown", {}).get("samples", {}).get(category, [])
+                if len(cd_samples) % 5 == 0:  # check every 5th notification
+                    _recalculate_cooldown_recommendation(state, event, category, ts)
+
+            # --- Cleanup stale records BEFORE write ---
+            _cleanup_stale_records(state)
+            write_state(state_path, state)
+
+        return {
+            "decision": decision,
+            "category": category,
+            "reason": reason,
+            "transition_count": len(transitions),
+            "suppression_until": suppression_until,
+            "cooldown_blocked": decision in ("WOULD_SUPPRESS_COOLDOWN", "SUPPRESSED_COOLDOWN"),
+        }
+
+    except Exception as exc:
+        LOG.error(
+            "FAIL_OPEN: rate-limit state error for %s: %s — "
+            "mail will be sent",
+            event["hostname"], exc,
+        )
+        return {
+            "decision": "FAIL_OPEN",
+            "category": category,
+            "reason": f"Rate-limit error: {exc} — mail sent anyway",
+        }
+
+
+def _cap_transitions(transitions, max_count):
+    """Cap a transition list after age-based pruning."""
+    if len(transitions) > max_count:
+        return transitions[-max_count:]
+    return transitions
+
+
+def _cleanup_stale_records(state):
+    """Remove hosts and categories with no recent activity.
+
+    Full stale-host scan is rate-limited to once per cleanup interval.
+    Per-category pruning (empty categories, child dicts) runs every time.
+    """
+    now_ts = now()
+    stale_host_days = CFG.get("state_retention", {}).get(
+        "stale_host_days", 30)
+    cleanup_interval = CFG.get("state_retention", {}).get(
+        "cleanup_interval_seconds", 3600)
+    max_transitions = CFG.get("state_retention", {}).get(
+        "max_transitions_per_category", 500)
+
+    # Always prune the current host's transitions for all categories
+    # (handled inline in evaluate_rate_limit via prune_transitions)
+
+    # Full scan: rate-limited
+    last_cleanup = state.get("_cleanup_last", 0)
+    if now_ts - last_cleanup < cleanup_interval:
+        return
+
+    state["_cleanup_last"] = now_ts
+    stale_cutoff = now_ts - stale_host_days * 86400
+    stale_hosts = []
+
+    for hostname, rec in list(state.items()):
+        if hostname.startswith("_") or not isinstance(rec, dict):
+            continue
+
+        for cat_key in ("host_state", "service_state_ping"):
+            cat_rec = rec.get(cat_key)
+            if not isinstance(cat_rec, dict):
+                continue
+
+            # Cap transition lists
+            transitions = cat_rec.get("transitions", [])
+            if transitions:
+                cat_rec["transitions"] = _cap_transitions(
+                    transitions, max_transitions)
+
+            # Remove empty category if no transitions and suppression expired
+            if (not transitions
+                    and cat_rec.get("suppression_until", 0) <= now_ts):
+                # Check adaptive learning — keep if still observing
+                ad = cat_rec.get("adaptive", {})
+                if ad.get("first_observation", 0) == 0 or ad.get("first_observation", 0) > stale_cutoff:
+                    rec.pop(cat_key, None)
+
+        # After cleaning categories, check if host is completely stale
+        remaining_cats = [k for k in ("host_state", "service_state_ping")
+                          if isinstance(rec.get(k), dict)]
+        if not remaining_cats:
+            # Also check suppression: if any active, keep
+            any_suppression = any(
+                isinstance(rec.get(k), dict)
+                and rec[k].get("suppression_until", 0) > now_ts
+                for k in ("host_state", "service_state_ping")
+            )
+            if not any_suppression:
+                stale_hosts.append(hostname)
+
+    for hostname in stale_hosts:
+        del state[hostname]
+
+    if stale_hosts:
+        LOG.debug("Cleaned up %d stale host records", len(stale_hosts))
+
+    # Cooldown sample retention
+    cd_tracking = state.get("cooldown", {})
+    cd_samples = cd_tracking.get("samples", {})
+    for cat in ("host_state", "service_state_ping"):
+        samples = cd_samples.get(cat, [])
+        if not samples:
+            continue
+        # Age-based pruning
+        cutoff = now_ts - 30 * 86400
+        samples[:] = [s for s in samples if s >= cutoff]
+        # Cap by count
+        if len(samples) > 500:
+            samples[:] = samples[-500:]
+        cd_samples[cat] = samples
+
+
+# ---------------------------------------------------------------------------
+# Cooldown evaluation
+# ---------------------------------------------------------------------------
+
+
+def _get_cooldown_seconds(category):
+    """Return effective cooldown seconds for a category.
+
+    Checks per_category override first, then default_seconds.
+    """
+    cd = CFG.get("cooldown", {})
+    per_cat = cd.get("per_category", {})
+    if category in per_cat and per_cat[category]:
+        return per_cat[category]
+    return cd.get("default_seconds", 3600)
+
+
+def _is_recovery(event):
+    """Detect whether this notification is a recovery.
+
+    Recovery = the new state is UP (host) or OK (service).
+    """
+    if event["is_host"]:
+        return event["new_state"] in ("UP",)
+    return event["new_state"] in ("OK",)
+
+
+def _evaluate_cooldown(state, event, category, ts):
+    """Evaluate cooldown for a (host, category) pair.
+
+    Decision order:
+      1. If cooldown disabled → BYPASS
+      2. If recovery and preserve_recovery → BYPASS_RECOVERY
+      3. If last_delivery + cooldown > now → SUPPRESS/WOULD_SUPPRESS
+      4. Otherwise → PASS
+
+    Returns (decision_string, reason_string).
+    """
+    cd = CFG.get("cooldown", {})
+    if not cd.get("enabled", True):
+        return ("BYPASS", "Cooldown disabled")
+
+    cd_mode = cd.get("mode", "audit")
+    preserve = cd.get("preserve_recovery", True)
+
+    # Recovery bypass
+    if preserve and _is_recovery(event):
+        return ("COOLDOWN_BYPASS_RECOVERY",
+                "Recovery notification — bypassing cooldown")
+
+    cd_sec = _get_cooldown_seconds(category)
+    if cd_sec <= 0:
+        return ("BYPASS", "Cooldown seconds is zero or negative")
+
+    # Look up last delivery from cooldown tracking
+    cd_tracking = state.get("cooldown", {})
+    last_delivered = cd_tracking.get("last_delivered", {})
+    cat_map = last_delivered.get(category, {})
+    last_ts = cat_map.get(event["hostname"], 0)
+
+    if last_ts <= 0:
+        return ("BYPASS", "No previous delivery for this host+category")
+
+    elapsed = ts - last_ts
+    if elapsed >= cd_sec:
+        return ("BYPASS", "Cooldown expired")
+
+    remaining = cd_sec - elapsed
+    if cd_mode == "enforce":
+        return ("SUPPRESSED_COOLDOWN",
+                f"Cooldown active — {remaining}s remaining since last delivery")
+    return ("WOULD_SUPPRESS_COOLDOWN",
+            f"Audit mode — would suppress ({remaining}s cooldown remaining)")
+
+
+def _update_delivery_cooldown(event):
+    """Update the last_delivered timestamp in cooldown tracking.
+
+    Called after successful delivery.  Fail-open on error.
+    """
+    category, _ = is_supported_transition(event)
+    if category is None:
+        return
+    state_path = get_state_path()
+    lock_path = get_lock_path(state_path)
+    try:
+        with StateLock(lock_path):
+            state = read_state(state_path)
+            state = migrate_state(state)
+            if "cooldown" not in state:
+                state["cooldown"] = {"last_delivered": {}, "samples": {}}
+            cd_tracking = state["cooldown"]
+            if "last_delivered" not in cd_tracking:
+                cd_tracking["last_delivered"] = {}
+            if category not in cd_tracking["last_delivered"]:
+                cd_tracking["last_delivered"][category] = {}
+            cd_tracking["last_delivered"][category][event["hostname"]] = now()
+            write_state(state_path, state)
+    except Exception as exc:
+        LOG.warning("FAIL_OPEN: cooldown state update error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Cooldown adaptive learning
+# ---------------------------------------------------------------------------
+
+
+def _update_cooldown_adaptive(state, event, category, ts, was_delivered):
+    """Collect cooldown samples for adaptive recommendation.
+
+    Adds a sample timestamp for each delivery (or would-suppress)
+    to the cooldown samples list for the category.
+    Handles retention: 30 days, max 500 per category.
+    """
+    ad = CFG.get("adaptive", {}).get("cooldown", {})
+    if not ad.get("enabled", True):
+        return
+    try:
+        if "cooldown" not in state:
+            state["cooldown"] = {"last_delivered": {}, "samples": {}}
+        samples = state["cooldown"].setdefault("samples", {})
+        if category not in samples:
+            samples[category] = []
+        samples[category].append(ts)
+        # Retention: 30 days
+        cutoff = ts - 30 * 86400
+        samples[category] = [s for s in samples[category] if s >= cutoff]
+        # Cap by count
+        max_samples = 500
+        if len(samples[category]) > max_samples:
+            samples[category] = samples[category][-max_samples:]
+    except Exception as exc:
+        LOG.warning("FAIL_OPEN: cooldown adaptive sample error: %s", exc)
+
+
+def _recalculate_cooldown_recommendation(state, event, category, ts):
+    """Calculate and log an adaptive cooldown recommendation.
+
+    Tests each candidate cooldown value against historical samples
+    and reports expected reduction.  Logs ADAPTIVE_COOLDOWN_RECOMMENDATION.
+    Never changes active configuration.
+    """
+    ad = CFG.get("adaptive", {}).get("cooldown", {})
+    if not ad.get("enabled", True):
+        return
+
+    min_samples = ad.get("minimum_notification_samples", 20)
+    min_days = ad.get("minimum_learning_days", 3)
+    min_reduction = ad.get("minimum_expected_reduction_percent", 30)
+    candidates = ad.get("candidate_cooldowns", _COOLDOWN_CANDIDATES)
+
+    try:
+        tracking = state.get("cooldown", {})
+        samples = tracking.get("samples", {}).get(category, [])
+
+        if len(samples) < min_samples:
+            LOG.info("ADAPTIVE_COOLDOWN_RECOMMENDATION: "
+                     "insufficient samples (%d < %d) for %s/%s",
+                     len(samples), min_samples, event["hostname"], category)
+            return
+
+        # Check learning period
+        first_ts = min(samples) if samples else ts
+        learning_days = (ts - first_ts) / 86400
+        if learning_days < min_days:
+            LOG.info("ADAPTIVE_COOLDOWN_RECOMMENDATION: "
+                     "learning period too short (%.1f < %d days) for %s/%s",
+                     learning_days, min_days, event["hostname"], category)
+            return
+
+        total_notifications = len(samples)
+        best_candidate = candidates[0]
+        best_reduction = 0
+
+        for cd_sec in candidates:
+            would_pass = 0
+            would_block = 0
+            last_delivery = 0
+            for s_ts in sorted(samples):
+                if last_delivery and (s_ts - last_delivery) < cd_sec:
+                    would_block += 1
+                else:
+                    would_pass += 1
+                    last_delivery = s_ts
+
+            reduction = (would_block / total_notifications * 100) if total_notifications else 0
+            if reduction > best_reduction:
+                best_reduction = reduction
+                best_candidate = cd_sec
+
+        auto_apply_msg = str(ad.get("auto_apply", False)).lower()
+        if best_reduction >= min_reduction:
+            LOG.info("ADAPTIVE_COOLDOWN_RECOMMENDATION: "
+                     "%s/%s best_candidate=%ds expected_reduction=%.0f%% "
+                     "samples=%d learning_days=%.1f auto_apply=%s",
+                     event["hostname"], category,
+                     best_candidate, best_reduction,
+                     total_notifications, learning_days, auto_apply_msg)
+            # --- Auto-apply cooldown if enabled ---
+            if ad.get("auto_apply", False):
+                try:
+                    cfg_path = Path(CONFIG_PATH)
+                    cfg_data = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
+                    prev_sec = cfg_data.get("cooldown", {}).get("default_seconds")
+                    if "cooldown" not in cfg_data:
+                        cfg_data["cooldown"] = {}
+                    cfg_data["cooldown"]["default_seconds"] = best_candidate
+                    if "per_category" not in cfg_data["cooldown"]:
+                        cfg_data["cooldown"]["per_category"] = {}
+                    cfg_data["cooldown"]["per_category"][category] = best_candidate
+                    cfg_path.write_text(json.dumps(cfg_data, indent=4))
+                    LOG.info("ADAPTIVE_COOLDOWN_AUTO_APPLY: "
+                             "%s/%s cooldown=%ds (was %s) "
+                             "expected_reduction=%.0f%%",
+                             event["hostname"], category,
+                             best_candidate, str(prev_sec or "default"),
+                             best_reduction)
+                    # Update in-memory CFG for current invocation
+                    if "cooldown" not in CFG:
+                        CFG["cooldown"] = {}
+                    CFG["cooldown"]["default_seconds"] = best_candidate
+                    if "per_category" not in CFG["cooldown"]:
+                        CFG["cooldown"]["per_category"] = {}
+                    CFG["cooldown"]["per_category"][category] = best_candidate
+                except Exception as aa_exc:
+                    LOG.warning("AUTO_APPLY_ERROR: %s/%s: %s",
+                               event["hostname"], category, aa_exc)
+        else:
+            LOG.info("ADAPTIVE_COOLDOWN_RECOMMENDATION: "
+                     "%s/%s insufficient reduction (%.0f%% < %d%%) "
+                     "for any candidate — samples=%d learning_days=%.1f",
+                     event["hostname"], category,
+                     best_reduction, min_reduction,
+                     total_notifications, learning_days)
+    except Exception as exc:
+        LOG.warning("FAIL_OPEN: cooldown recommendation error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive learning subsystem
+# ---------------------------------------------------------------------------
+
+def _fresh_learning_record():
+    """Return a fresh adaptive learning record for one category."""
+    return {
+        "schema_version": 1,
+        "first_observation": 0,
+        "last_recalculation": 0,
+        "transition_samples": [],
+        "window_counts_30m": [],
+        "window_counts_60m": [],
+        "daily_transition_counts": {},
+        "peak_30m": 0,
+        "peak_60m": 0,
+        "recommended_threshold": None,
+        "recommendation_status": "INSUFFICIENT_DATA",
+    }
+
+
+def _ensure_adaptive(cat_rec):
+    """Return or create the adaptive sub-record for a category record."""
+    if "adaptive" not in cat_rec:
+        cat_rec["adaptive"] = _fresh_learning_record()
+    return cat_rec["adaptive"]
+
+
+def _update_adaptive(cat_rec, category, is_transition, ts):
+    """Update adaptive learning data for a single event.
+
+    This runs on every notification to keep counters fresh.
+    Recommendation recalculation is rate-limited to once every
+    recalculate_every_hours.
+    """
+    adaptive_cfg = CFG.get("adaptive", {})
+    if not adaptive_cfg.get("enabled", True):
+        return
+    if adaptive_cfg.get("mode") != "learning":
+        return
+
+    try:
+        ad = _ensure_adaptive(cat_rec)
+
+        if ad["first_observation"] == 0:
+            ad["first_observation"] = ts
+
+        # Record transition sample
+        if is_transition:
+            samples = ad.get("transition_samples", [])
+            samples.append(ts)
+            # Retention: keep only last 30 days
+            retention = 30 * 86400
+            cutoff = ts - retention
+            samples[:] = [s for s in samples if s >= cutoff]
+            # Cap by count after age pruning
+            max_samples = CFG.get("state_retention", {}).get(
+                "max_transitions_per_category", 500)
+            if len(samples) > max_samples:
+                samples[:] = samples[-max_samples:]
+            ad["transition_samples"] = samples
+
+            # Daily count
+            day_key = time.strftime("%Y-%m-%d", time.gmtime(ts))
+            daily = ad.get("daily_transition_counts", {})
+            daily[day_key] = daily.get(day_key, 0) + 1
+            # Retention: keep only last 90 days
+            old_days = [k for k in daily if k < time.strftime(
+                "%Y-%m-%d", time.gmtime(ts - 90 * 86400))]
+            for k in old_days:
+                del daily[k]
+            ad["daily_transition_counts"] = daily
+
+            # Sliding window counts
+            obs_window = CFG.get(category, {}).get("observation_window", 1800)
+            window_30m = obs_window
+            window_60m = max(obs_window, 3600)
+
+            recent_30m = [s for s in samples if s >= ts - window_30m]
+            recent_60m = [s for s in samples if s >= ts - window_60m]
+
+            wc30 = ad.get("window_counts_30m", [])
+            wc30.append(len(recent_30m))
+            ad["window_counts_30m"] = wc30[-100:]  # bounded
+            ad["peak_30m"] = max(ad.get("peak_30m", 0), len(recent_30m))
+
+            wc60 = ad.get("window_counts_60m", [])
+            wc60.append(len(recent_60m))
+            ad["window_counts_60m"] = wc60[-100:]
+            ad["peak_60m"] = max(ad.get("peak_60m", 0), len(recent_60m))
+
+        # Rate-limited recalculation (once every 24h unless explicitly overridden)
+        recalc_every = adaptive_cfg.get("recalculate_every_hours", 24) * 3600
+        if ts - ad.get("last_recalculation", 0) >= recalc_every:
+            _recalculate_recommendation(cat_rec, category, adaptive_cfg, ts)
+            ad["last_recalculation"] = ts
+
+    except Exception as exc:
+        LOG.warning(
+            "FAIL_OPEN: adaptive learning error for category=%s: %s",
+            category, exc,
+        )
+
+
+def _recalculate_recommendation(cat_rec, category, adaptive_cfg, ts):
+    """Calculate a recommended threshold from historical data.
+
+    The recommendation is derived from the configured percentile of
+    observed window transition counts, plus a safety margin, clamped
+    to hard limits.
+
+    The recommendation is never written into the active configuration.
+    """
+    ad = _ensure_adaptive(cat_rec)
+    samples = ad.get("transition_samples", [])
+    first_obs = ad.get("first_observation", 0)
+
+    min_days = adaptive_cfg.get("minimum_learning_days", 14)
+    min_samples = adaptive_cfg.get("minimum_transition_samples", 20)
+    pct = adaptive_cfg.get("percentile", 95)
+    margin = adaptive_cfg.get("safety_margin", 2)
+
+    # Check minimum requirements
+    learning_days = (ts - first_obs) / 86400 if first_obs else 0
+    total_samples = len(samples)
+
+    if learning_days < min_days or total_samples < min_samples:
+        ad["recommended_threshold"] = None
+        ad["recommendation_status"] = "INSUFFICIENT_DATA"
+        return
+
+    # Compute percentile from window counts
+    if category == "host_state":
+        window_counts = ad.get("window_counts_30m", [])
+    else:
+        window_counts = ad.get("window_counts_30m", [])
+
+    if not window_counts:
+        ad["recommended_threshold"] = None
+        ad["recommendation_status"] = "INSUFFICIENT_DATA"
+        return
+
+    sorted_counts = sorted(window_counts)
+    idx = int(math.ceil(pct / 100.0 * len(sorted_counts))) - 1
+    idx = int(math.ceil(pct / 100.0 * len(sorted_counts))) - 1
+    idx = max(0, min(idx, len(sorted_counts) - 1))
+    p95_value = sorted_counts[idx]
+
+    raw_recommendation = p95_value + margin
+
+    # Apply hard limits
+    if category == "host_state":
+        hard_min = 4
+        hard_max = 10
+    else:
+        hard_min = 6
+        hard_max = 20
+
+    clamped = max(hard_min, min(hard_max, raw_recommendation))
+
+    # Determine status
+    if raw_recommendation > hard_max:
+        status = "EXCESSIVE_INSTABILITY"
+        clamped = hard_max
+    elif clamped > CFG.get(category, {}).get("trigger_transitions", hard_min):
+        status = "RECOMMEND_HIGHER_THRESHOLD"
+    elif clamped < CFG.get(category, {}).get("trigger_transitions", hard_min):
+        status = "RECOMMEND_LOWER_THRESHOLD"
+    else:
+        status = "STABLE"
+
+    ad["recommended_threshold"] = clamped
+    ad["recommendation_status"] = status
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def log_decision(decision, event, rate_info):
+    """Write a structured log line for a rate-limit decision.
+
+    Uses _safe_log so that logging failures never propagate into
+    business logic.  Output is JSON Lines format.
+    """
+    adaptive = CFG.get("adaptive", {})
+    category = decision.get("category", "?")
+    cat_cfg = CFG.get(category, {}) if category else {}
+    cd_cfg = CFG.get("cooldown", {})
+    cd_mode = cd_cfg.get("mode", "audit")
+    cd_sec = _get_cooldown_seconds(category) if category else 0
+    log_record = {
+        "status": "DECISION",
+        "host": event["hostname"],
+        "category": category,
+        "old_state": event["old_state"],
+        "new_state": event["new_state"],
+        "decision": decision.get("decision", "?"),
+        "transition_count": decision.get("transition_count", "?"),
+        "window": cat_cfg.get("observation_window", "?"),
+        "suppress_until": decision.get("suppression_until", "?"),
+        "reason": decision.get("reason", "?"),
+        "adaptive_enabled": adaptive.get("enabled", "?"),
+        "adaptive_mode": adaptive.get("mode", "?"),
+        "auto_apply": adaptive.get("cooldown", {}).get("auto_apply", False),
+        "cooldown_mode": cd_mode,
+        "cooldown_seconds": cd_sec,
+        "cooldown_blocked": decision.get("cooldown_blocked", False),
+    }
+    _safe_log("INFO", log_record)
+
+
+# ---------------------------------------------------------------------------
+# Learning report (--learning-report CLI)
+# ---------------------------------------------------------------------------
+
+def print_learning_report():
+    """Print a read-only adaptive learning report to stdout.
+
+    This function is safe to run independently.  It reads state, never
+    modifies live configuration, and produces no email.
+    """
+    state_path = get_state_path()
+    lock_path = get_lock_path(state_path)
+
+    try:
+        with StateLock(lock_path):
+            state = read_state(state_path)
+            state = migrate_state(state)
+    except Exception as exc:
+        print(f"ERROR: cannot read state: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"{'=' * 72}")
+    print(f"  {SCRIPT_NAME} — Adaptive Learning Report")
+    print(f"  Mode: {CFG.get('mode', 'audit')}  "
+          f"Adaptive: {CFG.get('adaptive', {}).get('mode', '?')}")
+    print(f"{'=' * 72}")
+
+    hosts_found = 0
+    for hostname, rec in sorted(state.items()):
+        if hostname == "schema_version" or not isinstance(rec, dict):
+            continue
+        hosts_found += 1
+
+        print(f"\n  Host: {hostname}")
+        print(f"  {'─' * 68}")
+
+        for cat_label, cat_key in [
+            ("HOST STATE", "host_state"),
+            ("SERVICE STATE PING", "service_state_ping"),
+        ]:
+            cat_rec = rec.get(cat_key, {})
+            ad = cat_rec.get("adaptive", {})
+            configured = CFG.get(cat_key, {}).get("trigger_transitions", "?")
+            recommended = ad.get("recommended_threshold", "—")
+            status = ad.get("recommendation_status", "—")
+            first_obs = ad.get("first_observation", 0)
+            samples = len(ad.get("transition_samples", []))
+            peak_30m = ad.get("peak_30m", 0)
+            last_recalc = ad.get("last_recalculation", 0)
+            learning_days = (now() - first_obs) / 86400 if first_obs else 0
+
+            print(f"\n    {cat_label}:")
+            print(f"      configured threshold:    {configured}")
+            print(f"      recommended threshold:   {recommended}")
+            print(f"      learning period:         {learning_days:.1f} days")
+            print(f"      sample count:            {samples}")
+            print(f"      peak 30m transitions:    {peak_30m}")
+            print(f"      last recalculation:      "
+                  f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(last_recalc)) if last_recalc else 'never'}")
+            print(f"      recommendation status:   {status}")
+
+    if hosts_found == 0:
+        print("\n  No hosts in state yet.")
+
+    print(f"\n{'=' * 72}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI pre-validation
+# ---------------------------------------------------------------------------
+
+
+def _prevalidate_argv():
+    """Reject mixed utility arguments before argparse processes them.
+
+    argparse's built-in --help/-h action calls sys.exit(0) when it
+    encounters the flag, before rejecting any extra positional arguments.
+    This function catches those invalid combinations early:
+
+        --help extra             -> exit 2
+        -h extra                 -> exit 2
+        --version extra          -> exit 2
+        --learning-report extra  -> exit 2
+        --unknown                -> exit 2
+        positional               -> exit 2
+
+    Must run before parser.parse_args() so that --help cannot
+    short-circuit the check.  Normal (zero-arg) Checkmk invocation
+    passes through unchanged.
+    """
+    argv = sys.argv[1:]
+    if not argv:
+        return
+
+    known_flags = {"--help", "-h", "--version", "--learning-report"}
+    has_utility = any(a in known_flags for a in argv)
+    has_other = any(a not in known_flags for a in argv)
+
+    if has_utility and has_other:
+        print(
+            f"{SCRIPT_NAME}: error: utility flags accept no additional arguments",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    for a in argv:
+        if a.startswith("-") and a not in known_flags:
+            print(
+                f"{SCRIPT_NAME}: error: unrecognized argument: {a}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    # Positional arguments without any utility flag reach argparse normally
+    # and are rejected there with exit code 2.
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    """Entry point.
+
+    Supports --learning-report for read-only report output.
+    When called as a Checkmk notification handler, processes one event
+    with structured diagnostic logging.
+    """
+    _prevalidate_argv()
+
+    parser = argparse.ArgumentParser(
+        description=SCRIPT_DESCRIPTION,
+    )
+    parser.add_argument(
+        "--learning-report", action="store_true",
+        help="Print a read-only adaptive learning report",
+    )
+    parser.add_argument(
+        "--version", action="store_true",
+        help="Print version and exit",
+    )
+    args = parser.parse_args()
+
+    if args.version:
+        print(f"{SCRIPT_NAME} {VERSION}")
+        return 0
+
+    if args.learning_report:
+        return print_learning_report()
+
+    # --- Notification processing with structured logging ---
+    execution_id = _uuid.uuid4().hex
+    start_time = time.monotonic()
+
+    notify_type = os.environ.get("NOTIFY_NOTIFICATIONTYPE", "PROBLEM")
+    notify_reason = os.environ.get("NOTIFY_NOTIFICATIONREASON", "")
+
+    _safe_log("INFO", {
+        "execution_id": execution_id,
+        "status": "INVOKED",
+        "notification_type": notify_type,
+        "notification_reason": notify_reason,
+    })
+
+    delivery_attempted = False
+    delivery_result = "NOT_ATTEMPTED"
+    final_rc = 0
+    final_result = "DELIVERED"
+
+    try:
+        event = classify_notification()
+        _safe_log("INFO", {
+            "execution_id": execution_id,
+            "status": "ACCEPTED",
+            "host": event["hostname"],
+            "service": event.get("service_desc", "(host)"),
+            "old_state": event["old_state"],
+            "new_state": event["new_state"],
+            "notification_type": notify_type,
+            "notification_reason": notify_reason,
+        })
+
+        decision = evaluate_rate_limit(event)
+        log_decision(decision, event, {})
+
+        suppress_decisions = {"SUPPRESS", "SUPPRESSED_COOLDOWN"}
+        would_suppress_decisions = {"WOULD_SUPPRESS", "WOULD_SUPPRESS_COOLDOWN"}
+
+        if decision["decision"] in suppress_decisions:
+            final_result = "SUPPRESSED"
+            delivery_result = "NOT_ATTEMPTED"
+            log_status = "SUPPRESSED_COOLDOWN" if "COOLDOWN" in decision["decision"] else "SUPPRESSED"
+            _safe_log("INFO", {
+                "execution_id": execution_id,
+                "status": log_status,
+                "host": event["hostname"],
+                "category": decision.get("category", "?"),
+                "reason": decision.get("reason", "?"),
+                "cooldown_blocked": "COOLDOWN" in decision["decision"],
+            })
+            _safe_log("INFO", {
+                "execution_id": execution_id,
+                "status": "COMPLETE",
+                "result": final_result,
+                "exit_code": 0,
+                "delivery_attempted": False,
+                "delivery_result": delivery_result,
+                "duration_ms": int((time.monotonic() - start_time) * 1000),
+            })
+            return 0
+
+        if decision["decision"] in would_suppress_decisions:
+            _safe_log("INFO", {
+                "execution_id": execution_id,
+                "status": "WOULD_SUPPRESS_COOLDOWN",
+                "host": event["hostname"],
+                "category": decision.get("category", "?"),
+                "reason": decision.get("reason", "?"),
+            })
+
+        service_label = event.get("service_desc", "")
+        if event["is_host"]:
+            service_label = "Host Check"
+
+        delivery_attempted = True
+        _safe_log("INFO", {
+            "execution_id": execution_id,
+            "status": "DELIVERING",
+            "host": event["hostname"],
+            "service": service_label,
+        })
+
+        email = build_email_content(
+            to_email=event["to_email"],
+            hostname=event["hostname"],
+            service=service_label,
+            old_state=event["old_state"],
+            new_state=event["new_state"],
+            output=event["output"],
+            long_output=event["long_output"],
+            host_address=event["host_address"],
+            real_ip=event["real_ip"],
+            frp=event["frp"],
+            site=event["site"],
+            date=event["date"],
+        )
+
+        rc = send_email(email)
+
+        if rc == 0:
+            final_result = "DELIVERED"
+            delivery_result = "SUCCESS"
+            _update_delivery_cooldown(event)
+            _safe_log("INFO", {
+                "execution_id": execution_id,
+                "status": "DELIVERED",
+                "host": event["hostname"],
+                "service": service_label,
+                "rc": rc,
+            })
+        else:
+            final_result = "FAILED"
+            delivery_result = "FAILED"
+            _safe_log("ERROR", {
+                "execution_id": execution_id,
+                "status": "FAILED",
+                "host": event["hostname"],
+                "service": service_label,
+                "rc": rc,
+            })
+
+        if decision["decision"] in ("WOULD_SUPPRESS", "FAIL_OPEN"):
+            _safe_log("INFO", {
+                "execution_id": execution_id,
+                "status": "AUDIT_NOT_SUPPRESSED",
+                "host": event["hostname"],
+                "category": decision.get("category", "?"),
+                "reason": decision.get("reason", "?"),
+            })
+
+        final_rc = rc
+
+    except Exception:
+        exc_info = sys.exc_info()
+        exception_type = exc_info[0].__name__ if exc_info[0] else "?"
+        exc_str = str(exc_info[1]) if exc_info[1] else ""
+        final_result = "ERROR"
+        delivery_result = "NOT_ATTEMPTED"
+        final_rc = 2
+        _safe_log("ERROR", {
+            "execution_id": execution_id,
+            "status": "ERROR",
+            "exception_type": exception_type,
+            "sanitized_error": exc_str,
+            "delivery_attempted": delivery_attempted,
+            "delivery_result": delivery_result,
+        })
+
+    _safe_log("INFO", {
+        "execution_id": execution_id,
+        "status": "COMPLETE",
+        "result": final_result,
+        "exit_code": final_rc,
+        "delivery_attempted": delivery_attempted,
+        "delivery_result": delivery_result,
+        "duration_ms": int((time.monotonic() - start_time) * 1000),
+    })
+
+    return final_rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

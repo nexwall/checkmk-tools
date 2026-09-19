@@ -1,0 +1,12 @@
+{
+    "python.terminal.activateEnvironment": false,
+    "terminal.integrated.tabs.enabled": true,
+    "github.copilot.chat.codeGeneration.useInstructionFiles": true,
+    "github.copilot.chat.testGeneration.useInstructionFiles": true,
+    "github.copilot.chat.reviewSelection.useInstructionFiles": true,
+    "github.copilot.chat.commitMessageGeneration.instructions": [],
+    "chat.instructionsFilesLocations": {
+        ".github/copilot-instructions.md": true
+    },
+    "terminal.integrated.defaultProfile.windows": "WSL"
+}

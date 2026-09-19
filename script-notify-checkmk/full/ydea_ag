@@ -1,0 +1,1356 @@
+#!/usr/bin/env bash
+# Ydea AG
+# Copia completa di ydea_ag + funzioni intelligenti per rilevare e descrivere
+# problemi HOST DOWN (connection refused, network unreachable, timeout) e NO DATA
+# Genera descrizioni dettagliate con cause probabili e troubleshooting specifico
+set -euo pipefail
+
+# ===== CONFIG =====
+YDEA_TOOLKIT_DIR="/opt/ydea-toolkit"
+YDEA_TOOLKIT="${YDEA_TOOLKIT_DIR}/rydea-toolkit.sh"
+YDEA_ENV="${YDEA_TOOLKIT_DIR}/.env.ag"
+YDEA_CONFIG="${YDEA_TOOLKIT_DIR}/premium-mon-config.json"
+YDEA_CACHE_DIR="/opt/ydea-toolkit/cache"
+TICKET_CACHE="${YDEA_CACHE_DIR}/ydea_checkmk_tickets.json"
+FLAPPING_CACHE="${YDEA_CACHE_DIR}/ydea_checkmk_flapping.json"
+CACHE_LOCK="${YDEA_CACHE_DIR}/ydea_cache.lock"  # Usa /tmp invece di /var/lock per permessi
+RESOLVED_TICKET_TTL=$((5*24*3600))  # 5 giorni per ticket risolti
+CACHE_MAX_AGE=$((30*24*3600))  # 30 giorni per ticket non risolti (fallback)
+FLAPPING_THRESHOLD=5  # Numero cambi stato in finestra temporale
+FLAPPING_WINDOW=600   # Finestra temporale in secondi (10 minuti)
+
+# Aggregazione ticket per host (1 = un solo ticket per host, raccoglie tutte le note dei servizi)
+# Imposta AGGREGATE_BY_HOST=0 per tornare alla gestione ticket per servizio
+AGGREGATE_BY_HOST="${AGGREGATE_BY_HOST:-1}"
+
+# Per sicurezza, non marcare risolto il ticket su OK di un singolo servizio quando si aggrega per host
+# Se vuoi il comportamento precedente, imposta RESOLVE_ON_SERVICE_OK=1
+RESOLVE_ON_SERVICE_OK="${RESOLVE_ON_SERVICE_OK:-0}"
+
+# SLA Category ID per ticket CheckMK (8-tipologie = 147)
+YDEA_CATEGORY_ID="${YDEA_CATEGORY_ID:-147}"
+
+# ===== UTILITY =====
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2; }
+debug() { [[ "${DEBUG_YDEA:-0}" == "1" ]] && log "DEBUG: $*" || true; }
+
+# Timeout (secondi) per comandi del toolkit Ydea (search/list/create/comment/get)
+YDEA_TOOLKIT_TIMEOUT="${YDEA_TOOLKIT_TIMEOUT:-25}"
+
+toolkit_cmd() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$YDEA_TOOLKIT_TIMEOUT" "$YDEA_TOOLKIT" "$@"
+  else
+    "$YDEA_TOOLKIT" "$@"
+  fi
+}
+
+toolkit_cmd_t() {
+  local t="$1"; shift || true
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$t" "$YDEA_TOOLKIT" "$@"
+  else
+    "$YDEA_TOOLKIT" "$@"
+  fi
+}
+
+# Helper per logging eventi ticket nel formato usato dal monitor
+log_ticket_event() {
+  local event_type="$1"
+  local ticket_id="$2"
+  local details="${3:-}"
+  log "[TICKET-EVENT] [$event_type] #$ticket_id $details"
+}
+
+# Inizializza cache se non esiste e valida contenuto
+init_cache() {
+  # Crea directory cache se non esiste
+  mkdir -p "$YDEA_CACHE_DIR" 2>/dev/null || true
+  chmod 777 "$YDEA_CACHE_DIR" 2>/dev/null || true
+  
+  # Crea lock file con permessi permissivi se non esiste
+  if [[ ! -f "$CACHE_LOCK" ]]; then
+    touch "$CACHE_LOCK" 2>/dev/null || true
+    chmod 666 "$CACHE_LOCK" 2>/dev/null || true
+  fi
+  
+  # Valida e ripara TICKET_CACHE
+  if [[ ! -f "$TICKET_CACHE" ]]; then
+    echo '{}' > "$TICKET_CACHE" 2>/dev/null || {
+      log "ERROR: Impossibile creare $TICKET_CACHE"
+      return 1
+    }
+    chmod 666 "$TICKET_CACHE" 2>/dev/null || true
+  else
+    # Verifica che sia JSON valido
+    if ! jq empty "$TICKET_CACHE" 2>/dev/null; then
+      log "WARN: Cache ticket corrotta, backup e reset"
+      [[ -f "$TICKET_CACHE" ]] && cp "$TICKET_CACHE" "${TICKET_CACHE}.corrupt.$(date +%s)" 2>/dev/null || true
+      echo '{}' > "$TICKET_CACHE" 2>/dev/null || {
+        log "ERROR: Impossibile scrivere su $TICKET_CACHE"
+        return 1
+      }
+      chmod 666 "$TICKET_CACHE" 2>/dev/null || true
+    else
+      # Pulisci entry con ticket_id non numerici
+      local cleaned
+      cleaned=$(jq 'to_entries | map(
+        select(
+          .value.ticket_id != null and 
+          (.value.ticket_id | type) == "number" or
+          (.value.ticket_id | type) == "string" and (.value.ticket_id | test("^[0-9]+$"))
+        )
+      ) | from_entries' "$TICKET_CACHE" 2>/dev/null) || cleaned='{}'
+      echo "$cleaned" > "$TICKET_CACHE" 2>/dev/null || true
+      chmod 666 "$TICKET_CACHE" 2>/dev/null || true
+    fi
+  fi
+  
+  # Valida e ripara FLAPPING_CACHE
+  if [[ ! -f "$FLAPPING_CACHE" ]]; then
+    echo '{}' > "$FLAPPING_CACHE" 2>/dev/null || true
+    chmod 666 "$FLAPPING_CACHE" 2>/dev/null || true
+  else
+    if ! jq empty "$FLAPPING_CACHE" 2>/dev/null; then
+      log "WARN: Cache flapping corrotta, backup e reset"
+      [[ -f "$FLAPPING_CACHE" ]] && cp "$FLAPPING_CACHE" "${FLAPPING_CACHE}.corrupt.$(date +%s)" 2>/dev/null || true
+      echo '{}' > "$FLAPPING_CACHE" 2>/dev/null || true
+      chmod 666 "$FLAPPING_CACHE" 2>/dev/null || true
+    fi
+  fi
+  
+  # Pulisci entry vecchie (oltre CACHE_MAX_AGE)
+  clean_old_cache_entries
+  
+  # Verifica ticket aperti su Ydea e rimuovi quelli chiusi/non trovati
+  # DISABILITATO: causa problemi quando API Ydea è lenta o in errore
+  # cleanup_closed_tickets_from_cache
+}
+
+# Verifica tutti i ticket in cache su Ydea e rimuove quelli chiusi o non trovati
+# Eseguito all'avvio per mantenere la cache sincronizzata con Ydea
+cleanup_closed_tickets_from_cache() {
+  if [[ ! -f "$TICKET_CACHE" ]] || ! jq empty "$TICKET_CACHE" 2>/dev/null; then
+    return 0
+  fi
+  
+  # Leggi tutti i ticket_id dalla cache
+  local ticket_ids
+  ticket_ids=$(jq -r '.[] | select(.ticket_id != null) | .ticket_id' "$TICKET_CACHE" 2>/dev/null | sort -u)
+  
+  if [[ -z "$ticket_ids" ]]; then
+    debug "Nessun ticket in cache da verificare"
+    return 0
+  fi
+  
+  local total_count
+  total_count=$(echo "$ticket_ids" | wc -l)
+  local removed_count=0
+  
+  log "Verifica stato di $total_count ticket su Ydea..."
+  
+  # Verifica ogni ticket
+  echo "$ticket_ids" | while IFS= read -r ticket_id; do
+    [[ -z "$ticket_id" ]] && continue
+    
+    ticket_is_open_on_api "$ticket_id"
+    local status=$?
+    
+    # Se ticket chiuso (1) o non trovato (2), rimuovi dalla cache
+    if [[ $status -eq 1 || $status -eq 2 ]]; then
+      local status_msg="chiuso/risolto"
+      [[ $status -eq 2 ]] && status_msg="non trovato (404)"
+      
+      debug "Ticket #$ticket_id $status_msg, rimozione dalla cache"
+      
+      # Trova tutte le chiavi con questo ticket_id
+      local keys_to_remove
+      keys_to_remove=$(jq -r --arg tid "$ticket_id" 'to_entries | .[] | select(.value.ticket_id == ($tid | tonumber)) | .key' "$TICKET_CACHE" 2>/dev/null)
+      
+      if [[ -n "$keys_to_remove" ]]; then
+        echo "$keys_to_remove" | while IFS= read -r key; do
+          [[ -z "$key" ]] && continue
+          remove_ticket_from_cache "$key"
+          removed_count=$((removed_count + 1))
+        done
+      fi
+    fi
+  done
+  
+  if [[ $removed_count -gt 0 ]]; then
+    log " Rimossi $removed_count ticket chiusi/non trovati dalla cache"
+  else
+    log " Tutti i ticket in cache sono ancora aperti su Ydea"
+  fi
+}
+
+# Pulisci entry vecchie dalla cache
+# - Ticket risolti (resolved_at != null): rimossi dopo RESOLVED_TICKET_TTL (5 giorni)
+# - Ticket attivi (resolved_at == null): rimossi dopo CACHE_MAX_AGE (30 giorni)
+clean_old_cache_entries() {
+  local now
+  now=$(date -u +%s)
+  local resolved_cutoff=$((now - RESOLVED_TICKET_TTL))
+  local active_cutoff=$((now - CACHE_MAX_AGE))
+  
+  if [[ -f "$TICKET_CACHE" ]] && jq empty "$TICKET_CACHE" 2>/dev/null; then
+    local cleaned
+    cleaned=$(jq --arg resolved_cutoff "$resolved_cutoff" --arg active_cutoff "$active_cutoff" '
+      to_entries | map(
+        select(
+          # Ticket risolti: controlla resolved_at
+          if .value.resolved_at != null then
+            (.value.resolved_at | tonumber) > ($resolved_cutoff | tonumber)
+          # Ticket attivi: controlla last_update
+          else
+            .value.last_update != null and
+            (.value.last_update | tonumber) > ($active_cutoff | tonumber)
+          end
+        )
+      ) | from_entries
+    ' "$TICKET_CACHE" 2>/dev/null) || cleaned='{}'
+    
+    # Solo aggiorna se ci sono state modifiche
+    if [[ "$cleaned" != "$(cat "$TICKET_CACHE")" ]]; then
+      atomic_cache_write "$TICKET_CACHE" "$cleaned"
+      debug "Cache pulita: rimosse entry vecchie (resolved > 5gg, active > 30gg)"
+    fi
+  fi
+}
+
+# ===== FUNZIONI CACHE =====
+# Scrittura atomica con lock per evitare race conditions
+atomic_cache_write() {
+  local cache_file="$1"
+  local content="$2"
+  local temp_file="${cache_file}.tmp.$$"
+  
+  # Verifica permessi scrittura prima di procedere
+  if [[ ! -w "$(dirname "$cache_file")" ]]; then
+    log "ERROR: Nessun permesso di scrittura su $(dirname "$cache_file")"
+    return 1
+  fi
+  
+  # Usa flock per garantire scrittura atomica
+  local write_result
+  (
+    flock -x -w 5 200 || {
+      log "WARN: Timeout acquisizione lock per $cache_file, uso fallback"
+      # Fallback: scrivi direttamente senza lock
+      echo "$content" > "$cache_file" 2>/dev/null || {
+        log "ERROR: Fallback scrittura fallito per $cache_file"
+        exit 1
+      }
+      exit 0
+    }
+    
+    echo "$content" > "$temp_file" 2>/dev/null || {
+      log "ERROR: Impossibile scrivere temp file $temp_file"
+      exit 1
+    }
+    chmod 666 "$temp_file" 2>/dev/null || true
+    sync
+    mv "$temp_file" "$cache_file" 2>/dev/null || {
+      log "ERROR: Impossibile spostare $temp_file a $cache_file"
+      rm -f "$temp_file" 2>/dev/null
+      exit 1
+    }
+    chmod 666 "$cache_file" 2>/dev/null || true
+    sync
+    exit 0
+    
+  ) 200>"${CACHE_LOCK}"
+  write_result=$?
+  
+  if [[ $write_result -ne 0 ]]; then
+    log "ERROR: atomic_cache_write fallito con codice $write_result"
+    return 1
+  fi
+  
+  debug "atomic_cache_write OK: $cache_file"
+  return 0
+}
+
+# Genera chiave univoca per ticket: IP/HOSTNAME:SERVIZIO
+get_ticket_key() {
+  local host="${1}"
+  local service="${2:-HOST}"
+  if [[ "${AGGREGATE_BY_HOST}" == "1" ]]; then
+    # Un solo ticket per host (indipendente dal servizio)
+    echo "${host}"
+  else
+    echo "${host}:${service}"
+  fi
+}
+
+# Determina tipologia Ydea in base al servizio/host usando config JSON
+determine_tipo() {
+  local hostname="${1:-}"
+  local service="${2:-}"
+  local output="${3:-}"
+  
+  # Se non esiste il file di config, usa default
+  if [[ ! -f "$YDEA_CONFIG" ]]; then
+    debug "Config file non trovato: $YDEA_CONFIG, uso default 'Server'"
+    echo "Server"
+    return 0
+  fi
+  
+  # PRIORITÀ 1: Controlla label CheckMK per OS
+  local os_family="${NOTIFY_HOSTLABEL_cmk_os_family:-}"
+  local os_type="${NOTIFY_HOSTLABEL_cmk_os_type:-}"
+  local os_platform="${NOTIFY_HOSTLABEL_cmk_os_platform:-}"
+  
+  debug "CheckMK Labels: os_family='$os_family' os_type='$os_type' os_platform='$os_platform'"
+  
+  # Mappa OS → Tipologia
+  if [[ "$os_family" == "windows" ]] || [[ "$os_type" == "windows" ]]; then
+    # Windows = Computer Client (workstation/laptop/PC)
+    debug "OS rilevato: Windows → Computer Client"
+    echo "Computer Client"
+    return 0
+  elif [[ "$os_platform" =~ nethvoice ]] && echo "$hostname $service" | grep -qiE '(pbx|voip|asterisk|freepbx|nethvoice)'; then
+    # NethVoice SOLO se hostname/service contiene keyword VoIP
+    debug "OS rilevato: NethVoice + servizio VoIP → Centrale Telefonica Nethvoice"
+    echo "Centrale Telefonica Nethvoice"
+    return 0
+  elif [[ "$os_platform" =~ nethsecurity ]]; then
+    debug "OS rilevato: NethSecurity → Firewall UTM Nethsecurity"
+    echo "Firewall UTM Nethsecurity"
+    return 0
+  elif [[ "$os_platform" =~ nethserver ]] || [[ "$os_platform" =~ nethservice ]] || [[ "$os_platform" =~ nethvoice ]]; then
+    # NethServer/NethService/NethVoice senza servizi VoIP = Server
+    debug "OS rilevato: NethServer/NethService → Server"
+    echo "Server"
+    return 0
+  elif [[ "$os_family" == "linux" ]] || [[ "$os_type" == "linux" ]]; then
+    # Linux generico = Server (salvo casi specifici sotto)
+    debug "OS rilevato: Linux generico → Server"
+    echo "Server"
+    return 0
+  fi
+  
+  # PRIORITÀ 2: Prefisso hostname
+  if echo "$hostname" | grep -qiE '^(nb|laptop|pc|ws|workstation|client)-'; then
+    debug "Hostname prefix match: $hostname → Computer Client"
+    echo "Computer Client"
+    return 0
+  elif echo "$hostname" | grep -qiE '^(srv|server|host|node|db|database)-'; then
+    debug "Hostname prefix match: $hostname → Server"
+    echo "Server"
+    return 0
+  fi
+  
+  # PRIORITÀ 3: Keyword matching nel service/output
+  local search_text
+  search_text=$(echo "$hostname $service $output" | tr '[:upper:]' '[:lower:]')
+  
+  # Cerca match in ogni tipologia
+  local tipologie
+  tipologie=$(jq -r '.tipologie | keys[]' "$YDEA_CONFIG" 2>/dev/null)
+  
+  while IFS= read -r tipologia_key; do
+    [[ -z "$tipologia_key" ]] && continue
+    
+    # Controlla se qualche keyword di questa tipologia matcha
+    local keywords
+    keywords=$(jq -r ".tipologie.${tipologia_key}.keywords[]" "$YDEA_CONFIG" 2>/dev/null)
+    
+    while IFS= read -r keyword; do
+      [[ -z "$keyword" ]] && continue
+      if echo "$search_text" | grep -qi "$keyword"; then
+        # Match trovato - ritorna il tipo e esci
+        local tipo_match
+        tipo_match=$(jq -r ".tipologie.${tipologia_key}.tipo_ydea" "$YDEA_CONFIG" 2>/dev/null | head -n1)
+        debug "Keyword match: '$keyword' → $tipo_match"
+        echo "$tipo_match"
+        return 0
+      fi
+    done <<< "$keywords"
+  done <<< "$tipologie"
+  
+  # Default se non trovato match
+  local default_tipo
+  default_tipo=$(jq -r '.default_tipo // "Server"' "$YDEA_CONFIG" 2>/dev/null)
+  debug "Nessun match trovato, uso default: $default_tipo"
+  echo "${default_tipo:-Server}"
+}
+
+# Costruisce un marcatore univoco da inserire nel titolo/testo per facilitare il riuso lato Ydea
+build_cmk_marker() {
+  local host_name="$1"
+  local ip_addr="$2"
+  echo "[CMK HOST=${host_name} IP=${ip_addr}]"
+}
+
+# Verifica se esiste ticket aperto per questo alert
+ticket_exists() {
+  local key="$1"
+  init_cache
+  jq -e --arg key "$key" '.[$key] != null' "$TICKET_CACHE" >/dev/null 2>&1
+}
+
+# Ottieni ID ticket dalla cache
+get_ticket_id() {
+  local key="$1"
+  init_cache
+  jq -r --arg key "$key" '.[$key].ticket_id // empty' "$TICKET_CACHE"
+}
+
+# Salva ticket in cache
+save_ticket_cache() {
+  local key="$1"
+  local ticket_id="$2"
+  local state="$3"
+  init_cache
+  
+  local updated_cache
+  updated_cache=$(jq --arg key "$key" \
+     --arg id "$ticket_id" \
+     --arg state "$state" \
+     --arg ts "$(date -u +%s)" \
+    '.[$key] = {ticket_id: ($id | tonumber), state: $state, created_at: ($ts | tonumber), last_update: ($ts | tonumber), resolved_at: null}' \
+    "$TICKET_CACHE" 2>/dev/null) || {
+    log "ERRORE: Impossibile generare JSON per cache"
+    return 1
+  }
+  
+  atomic_cache_write "$TICKET_CACHE" "$updated_cache" || {
+    log "ERRORE: atomic_cache_write fallito per $key"
+    return 1
+  }
+  debug "Ticket salvato in cache: $key -> $ticket_id"
+}
+
+# Marca ticket come risolto (imposta resolved_at timestamp)
+mark_ticket_resolved() {
+  local key="$1"
+  init_cache
+  
+  # Verifica che il ticket esista in cache
+  if ! ticket_exists "$key"; then
+    debug "Ticket $key non in cache, skip mark_resolved"
+    return 0
+  fi
+  
+  local updated_cache
+  updated_cache=$(jq --arg key "$key" \
+     --arg ts "$(date -u +%s)" \
+    '.[$key].resolved_at = ($ts | tonumber) | .[$key].last_update = ($ts | tonumber)' \
+    "$TICKET_CACHE" 2>/dev/null) || {
+    log "WARN: Impossibile marcare ticket risolto per $key"
+    return 1
+  }
+  
+  atomic_cache_write "$TICKET_CACHE" "$updated_cache"
+  debug "Ticket $key marcato come risolto, cleanup tra 5 giorni"
+}
+
+# Aggiorna ultimo stato in cache
+update_ticket_state() {
+  local key="$1"
+  local state="$2"
+  init_cache
+  
+  local updated_cache
+  # Se stato torna CRITICAL/DOWN, resetta resolved_at a null
+  if [[ "$state" == "CRITICAL" || "$state" == "CRIT" || "$state" == "DOWN" ]]; then
+    updated_cache=$(jq --arg key "$key" \
+       --arg state "$state" \
+       --arg ts "$(date -u +%s)" \
+      '.[$key].state = $state | .[$key].last_update = ($ts | tonumber) | .[$key].resolved_at = null' \
+      "$TICKET_CACHE" 2>/dev/null) || {
+      log "WARN: Impossibile aggiornare stato in cache per $key"
+      return 1
+    }
+  else
+    # Altri stati (WARNING, UNKNOWN, ecc.) - non toccare resolved_at
+    updated_cache=$(jq --arg key "$key" \
+       --arg state "$state" \
+       --arg ts "$(date -u +%s)" \
+      '.[$key].state = $state | .[$key].last_update = ($ts | tonumber)' \
+      "$TICKET_CACHE" 2>/dev/null) || {
+      log "WARN: Impossibile aggiornare stato in cache per $key"
+      return 1
+    }
+  fi
+  
+  atomic_cache_write "$TICKET_CACHE" "$updated_cache"
+}
+
+# ===== FLAPPING DETECTION =====
+# Registra cambio stato per detection flapping
+record_state_change() {
+  local key="$1"
+  local state="$2"
+  local now
+  now="$(date -u +%s)"
+  init_cache
+  
+  # Aggiungi nuovo cambio stato
+  local updated_cache
+  updated_cache=$(jq --arg key "$key" \
+     --arg state "$state" \
+     --arg ts "$now" \
+    '.[$key] = ((.[$key] // []) + [{state: $state, timestamp: ($ts|tonumber)}])' \
+    "$FLAPPING_CACHE" 2>/dev/null) || {
+    log "WARN: Impossibile registrare cambio stato per $key"
+    return 1
+  }
+  
+  atomic_cache_write "$FLAPPING_CACHE" "$updated_cache"
+  
+  # Pulisci eventi vecchi (fuori dalla finestra temporale)
+  local cutoff=$((now - FLAPPING_WINDOW))
+  updated_cache=$(jq --arg key "$key" \
+     --arg cutoff "$cutoff" \
+    '.[$key] = [.[$key][] | select(.timestamp > ($cutoff|tonumber))]' \
+    "$FLAPPING_CACHE" 2>/dev/null) || return 0
+  
+  atomic_cache_write "$FLAPPING_CACHE" "$updated_cache"
+}
+
+# Verifica se il servizio è in flapping
+is_flapping() {
+  local key="$1"
+  init_cache
+  local count
+  count=$(jq --arg key "$key" '.[$key] // [] | length' "$FLAPPING_CACHE")
+  [[ "$count" -ge "$FLAPPING_THRESHOLD" ]]
+}
+
+# Ottieni conteggio cambi stato
+get_state_changes_count() {
+  local key="$1"
+  init_cache
+  jq --arg key "$key" '.[$key] // [] | length' "$FLAPPING_CACHE"
+}
+
+# ===== EMOJI PER STATI =====
+get_emoji() {
+  case "${1^^}" in
+    OK|UP) echo "" ;;
+    WARN|WARNING) echo "" ;;
+    CRIT|CRITICAL|DOWN) echo "" ;;
+    UNKNOWN) echo "" ;;
+    *) echo "" ;;
+  esac
+}
+
+# ===== FORMATTAZIONE OUTPUT =====
+# Formatta output plugin in modo più leggibile (sintetico)
+format_output() {
+  local output="$1"
+  # Rimuovi caratteri speciali eccessivi e limita lunghezza
+  echo "$output" | tr -d '\r' | head -c 500
+}
+
+# ===== GESTIONE TICKET YDEA =====
+# Carica ambiente Ydea
+load_ydea_env() {
+  if [[ ! -f "$YDEA_ENV" ]]; then
+    log "ERRORE: File .env non trovato in $YDEA_ENV"
+    exit 1
+  fi
+  # shellcheck source=/opt/checkmk-tools/Ydea-Toolkit/.env
+  source "$YDEA_ENV"
+  
+  # Esporta variabili per il toolkit (evita che il toolkit le sovrascriva)
+  export YDEA_ID
+  export YDEA_API_KEY
+  export YDEA_USER_ID
+  export YDEA_USER_ID_CREATE_NOTE
+  export YDEA_USER_ID_CREATE_TICKET
+  
+  if [[ ! -x "$YDEA_TOOLKIT" ]]; then
+    log "ERRORE: Script ydea-toolkit.sh non trovato o non eseguibile in $YDEA_TOOLKIT"
+    exit 1
+  fi
+}
+
+# Cerca un ticket aperto esistente su Ydea per host/IP (fallback quando cache manca)
+find_open_ticket_for_host() {
+  local host_name="$1"
+  local ip_addr="$2"
+
+  # Richiede toolkit caricato
+  [[ -x "$YDEA_TOOLKIT" ]] || return 1
+
+  local candidates='[]'
+  local queries=()
+  [[ -n "$host_name" && "$host_name" != "unknown" ]] && queries+=("$host_name")
+  [[ -n "$ip_addr" && "$ip_addr" != "unknown" ]] && queries+=("$ip_addr")
+
+  debug "Fallback API search for host: '$host_name' ip: '$ip_addr'"
+
+  for q in "${queries[@]}"; do
+    # Esegui ricerca
+    local result json_line arr filtered
+    result=$(toolkit_cmd search "$q" 50 2>&1) || continue
+    json_line=$(echo "$result" | grep -E '^\{.*\}$' | tail -n1)
+    [[ -z "$json_line" ]] && continue
+
+    # Normalizza a lista
+    arr=$(echo "$json_line" | jq -c '.objs // .data // []' 2>/dev/null)
+    [[ -z "$arr" ]] && arr='[]'
+
+    # Prepara pattern alternato host|ip, correttamente escapato
+    local esc_host esc_ip pattern
+    esc_host=$(printf '%s' "$host_name" | sed 's/[^^$.*+?{}|()\[\]\\]/\\&/g')
+    esc_ip=$(printf '%s' "$ip_addr" | sed 's/[^^$.*+?{}|()\[\]\\]/\\&/g')
+    if [[ -n "$esc_host" && -n "$esc_ip" ]]; then
+      pattern="(?i)(${esc_host}|${esc_ip})"
+    else
+      pattern="(?i)(${esc_host}${esc_ip})"
+    fi
+
+    # Filtra ticket aperti che matchano host/ip in titolo o testo
+    filtered=$(echo "$arr" | jq -c --arg re "$pattern" '
+      [ .[]
+        | select(((.stato // .status // "") | test("(?i)effettuato|chiuso|completato|risolto|closed|resolved") | not))
+        | select(( ((.titolo // .title // "") + " " + (.testo // .description // "")) | test($re)))
+      ]' 2>/dev/null)
+    [[ -z "$filtered" ]] && filtered='[]'
+
+    # Accumula
+    candidates=$(jq -c --argjson a "$candidates" --argjson b "$filtered" -n '$a + $b')
+  done
+
+  # Se non abbiamo trovato con search, prova lista open tickets lato API e filtra localmente
+  if [[ $(echo "$candidates" | jq 'length') -eq 0 ]]; then
+    debug "Fallback seconda fase: lista open tickets e filtro locale"
+    local result json_line filtered
+    local arr='[]'
+    result=$(toolkit_cmd list 100 open 2>&1) || true
+    json_line=$(echo "$result" | grep -E '^\{.*\}$' | tail -n1)
+    [[ -n "$json_line" ]] && arr=$(echo "$json_line" | jq -c '.objs // .data // []' 2>/dev/null)
+    [[ -z "$arr" ]] && arr='[]'
+
+    # Pattern preferenziale: marcatore CMK in titolo o testo
+    local pattern_mark pattern_basic esc_host esc_ip
+    esc_host=$(printf '%s' "$host_name" | sed 's/[^^$.*+?{}|()\[\]\\]/\\&/g')
+    esc_ip=$(printf '%s' "$ip_addr" | sed 's/[^^$.*+?{}|()\[\]\\]/\\&/g')
+    pattern_mark=$(printf '(?i)(CMK HOST=%s).*?(IP=%s)' "$esc_host" "$esc_ip")
+    if [[ -n "$esc_host" && -n "$esc_ip" ]]; then
+      pattern_basic="(?i)(${esc_host}|${esc_ip})"
+    else
+      pattern_basic="(?i)(${esc_host}${esc_ip})"
+    fi
+
+    # Prima prova: match sul marcatore
+    filtered=$(echo "$arr" | jq -c --arg re "$pattern_mark" '
+      [ .[]
+        | select(((.stato // .status // "") | test("(?i)effettuato|chiuso|completato|risolto|closed|resolved") | not))
+        | select((((.titolo // .title // "") + " " + (.testo // .description // "")) | test($re)))
+      ]' 2>/dev/null)
+    [[ -z "$filtered" || "$filtered" == "[]" ]] && filtered=$(echo "$arr" | jq -c --arg re "$pattern_basic" '
+      [ .[]
+        | select(((.stato // .status // "") | test("(?i)effettuato|chiuso|completato|risolto|closed|resolved") | not))
+        | select((((.titolo // .title // "") + " " + (.testo // .description // "")) | test($re)))
+      ]' 2>/dev/null)
+
+    candidates="$filtered"
+  fi
+
+  # Dedupe candidati e scegli quello con id massimo (più recente)
+  local selected_id
+  selected_id=$(echo "$candidates" | jq -r '[.[]] | unique_by(.id) | if length>0 then (max_by((.id // 0)) | .id) else empty end' 2>/dev/null)
+  if [[ -n "$selected_id" ]]; then
+    echo "$selected_id"
+    return 0
+  fi
+
+  return 1
+}
+
+# Cerca un ticket aperto esistente per marcatore esatto (titolo o testo contiene la stringa marker)
+find_ticket_by_marker() {
+  local host_name="$1"
+  local ip_addr="$2"
+  local marker
+  marker="$(build_cmk_marker "$host_name" "$ip_addr")"
+
+  [[ -x "$YDEA_TOOLKIT" ]] || return 1
+  debug "Ricerca per marcatore esatto: $marker"
+
+  local result json_line arr filtered
+  result=$(toolkit_cmd list 100 open 2>&1) || return 1
+  json_line=$(echo "$result" | grep -E '^\{.*\}$' | tail -n1)
+  [[ -z "$json_line" ]] && return 1
+  arr=$(echo "$json_line" | jq -c '.objs // .data // []' 2>/dev/null)
+  [[ -z "$arr" ]] && arr='[]'
+
+  filtered=$(echo "$arr" | jq -c --arg marker "$marker" '
+    [ .[]
+      | select(((.stato // .status // "") | test("(?i)chiuso|risolto|closed|resolved") | not))
+      | select((((.titolo // .title // "") + "\n" + (.testo // .description // "")) | contains($marker)))
+    ]' 2>/dev/null)
+
+  local selected_id
+  selected_id=$(echo "$filtered" | jq -r 'if length>0 then (max_by((.id // 0)) | .id) else empty end' 2>/dev/null)
+  [[ -n "$selected_id" ]] && { echo "$selected_id"; return 0; }
+  return 1
+}
+
+# Crea nuovo ticket su Ydea
+create_ydea_ticket() {
+  local title="$1"
+  local description="$2"
+  local priority="$3"
+  local category_id="${4:-$YDEA_CATEGORY_ID}"
+  local hostname="${5:-}"
+  local service="${6:-}"
+  local output="${7:-}"
+  
+  # Determina tipologia Ydea
+  local tipo
+  tipo=$(determine_tipo "$hostname" "$service" "$output")
+  debug "Tipologia determinata: $tipo"
+  
+  # ID creatore ticket (Lorenzo)
+  local creatoda="${YDEA_USER_ID:-12336}"
+
+  debug "Creazione ticket: $title (category: $category_id, tipo: $tipo, creatoda: $creatoda)"
+  local result
+  result=$(toolkit_cmd create "$title" "$description" "$priority" "$category_id" "$tipo" "$creatoda" 2>&1) || {
+    local exit_code=$?
+    if [[ $exit_code -eq 124 ]]; then
+      log "ERRORE creazione ticket: timeout dopo ${YDEA_TOOLKIT_TIMEOUT}s (toolkit create)"
+    else
+      log "ERRORE creazione ticket: $result"
+    fi
+    return 1
+  }
+  
+  # Estrai solo l'ultima riga JSON dalla risposta (ignora messaggi info)
+  local json_line
+  json_line=$(echo "$result" | grep -E '^\{.*\}$' | tail -n1)
+  
+  local ticket_id
+  ticket_id=$(echo "$json_line" | jq -r '.ticket_id // .id // .data.id // empty' 2>/dev/null)
+  
+  if [[ -z "$ticket_id" || "$ticket_id" == "null" ]]; then
+    log "ERRORE: Nessun ticket_id nella risposta: $result"
+    return 1
+  fi
+  
+  # Aggiungi descrizione come commento pubblico (l'API non supporta testo in creazione)
+  if [[ -n "$description" ]]; then
+    debug "Aggiunta descrizione come commento pubblico al ticket #$ticket_id"
+    toolkit_cmd comment "$ticket_id" "$description" true >&2 || {
+      log "WARN: Impossibile aggiungere descrizione al ticket #$ticket_id"
+    }
+  fi
+  
+  echo "$ticket_id"
+}
+
+# Aggiungi nota privata a ticket esistente
+add_private_note() {
+  local ticket_id="$1"
+  local note="$2"
+  
+  debug "Aggiunta nota privata a ticket #$ticket_id"
+  local result
+  result=$(toolkit_cmd comment "$ticket_id" "$note" 2>&1) || {
+    local exit_code=$?
+    # Verifica se è un errore 404 (ticket non trovato/chiuso) o API call fallita
+    if echo "$result" | grep -qi "404\|not found\|Ticket non trovato\|API call fallita"; then
+      log "WARN: Ticket #$ticket_id non trovato (404) - potrebbe essere stato cancellato"
+      return 2  # Return code speciale per 404
+    elif [[ $exit_code -eq 124 ]]; then
+      log "ERRORE aggiunta nota a ticket #$ticket_id: timeout dopo ${YDEA_TOOLKIT_TIMEOUT}s (toolkit comment)"
+      return 1
+    else
+      log "ERRORE aggiunta nota a ticket #$ticket_id: $result"
+      return 1
+    fi
+  }
+  
+  # Successo
+  return 0
+}
+
+# Verifica se ticket è aperto su Ydea tramite API
+# Return codes:
+#   0 = ticket aperto
+#   1 = ticket chiuso/risolto
+#   2 = ticket non trovato (404)
+#   3 = errore API generico
+ticket_is_open_on_api() {
+  local ticket_id="$1"
+  
+  debug "Verifica stato ticket #$ticket_id su API Ydea"
+  
+  # Usa ydea-toolkit per ottenere info ticket (con timeout 10 secondi)
+  local result
+  result=$(toolkit_cmd_t 10 get "$ticket_id" 2>&1) || {
+    local exit_code=$?
+    
+    # Timeout (exit code 124)
+    if [[ $exit_code -eq 124 ]]; then
+      log "WARN: Timeout verifica API ticket #$ticket_id (>10s)"
+      return 3
+    fi
+    
+    # Errore nell'API call - verifica se 404
+    if echo "$result" | grep -qi "404\|not found\|Ticket non trovato"; then
+      debug "Ticket #$ticket_id non trovato (404)"
+      return 2
+    else
+      debug "Errore API verifica ticket #$ticket_id: $result"
+      return 3
+    fi
+  }
+  
+  # Estrai JSON dalla risposta (ultima riga JSON valida)
+  local json_line
+  json_line=$(echo "$result" | grep -E '^\{.*\}$' | tail -n1)
+  
+  if [[ -z "$json_line" ]]; then
+    debug "Nessun JSON valido nella risposta API per ticket #$ticket_id"
+    return 3
+  fi
+  
+  # Verifica stato ticket (cerca campo stato/status)
+  # Stati Ydea comuni: "aperto", "in lavorazione", "chiuso", "risolto"
+  local stato
+  stato=$(echo "$json_line" | jq -r '.stato // .status // .state // empty' 2>/dev/null)
+  
+  if [[ -z "$stato" || "$stato" == "null" ]]; then
+    debug "Campo stato non trovato per ticket #$ticket_id, assume aperto"
+    return 0  # Default: assume aperto se non trova stato
+  fi
+  
+  # Verifica se chiuso/risolto (case-insensitive)
+  if echo "$stato" | grep -qiE "chiuso|risolto|closed|resolved"; then
+    debug "Ticket #$ticket_id in stato: $stato (chiuso)"
+    return 1
+  else
+    debug "Ticket #$ticket_id in stato: $stato (aperto)"
+    return 0
+  fi
+}
+
+# Rimuovi ticket dalla cache
+remove_ticket_from_cache() {
+  local key="$1"
+  init_cache
+  
+  debug "Rimozione ticket dalla cache: $key"
+  
+  local updated_cache
+  updated_cache=$(jq --arg key "$key" 'del(.[$key])' "$TICKET_CACHE" 2>/dev/null) || {
+    log "WARN: Impossibile rimuovere $key dalla cache"
+    return 1
+  }
+  
+  atomic_cache_write "$TICKET_CACHE" "$updated_cache"
+}
+
+# ===== CONTROLLO SERVIZI ESTERNI =====
+main() {
+  # Carica configurazione Ydea
+  load_ydea_env
+  
+  # Ottieni Real IP (da label o fallback a NOTIFY_HOSTADDRESS)
+  REAL_IP="${NOTIFY_HOSTLABEL_real_ip:-${NOTIFY_HOSTADDRESS:-unknown}}"
+  HOSTNAME="${NOTIFY_HOSTNAME:-unknown}"
+  
+  # DEBUG: mostra cosa contengono HOSTNAME e REAL_IP
+  log "DEBUG: NOTIFY_HOSTNAME='${NOTIFY_HOSTNAME:-}' HOSTNAME='$HOSTNAME' REAL_IP='$REAL_IP'"
+  
+  # Determina se è alert HOST o SERVICE
+  if [[ "${NOTIFY_WHAT:-SERVICE}" == "SERVICE" ]]; then
+    # === ALERT SERVICE ===
+    SERVICE="${NOTIFY_SERVICEDESC:-UNKNOWN}"
+    STATE="${NOTIFY_SERVICESTATE:-UNKNOWN}"
+    LAST_STATE="${NOTIFY_LASTSERVICESTATE:-UNKNOWN}"
+    OUTPUT="${NOTIFY_SERVICEOUTPUT:-N/A}"
+    STATE_TYPE="${NOTIFY_SERVICESTATETYPE:-HARD}"
+    
+    # Aggregazione per host: usa l'HOSTNAME come chiave
+    TICKET_KEY=$(get_ticket_key "$HOSTNAME" "$SERVICE")
+    
+    # Formatta output sintetico
+    OUTPUT_SHORT=$(format_output "$OUTPUT")
+    
+    log "SERVICE Alert: $HOSTNAME ($REAL_IP) - $SERVICE | $LAST_STATE -> $STATE"
+    
+    # Registra cambio stato per flapping detection
+    record_state_change "$TICKET_KEY" "$STATE"
+    
+    # Verifica flapping
+    FLAPPING_STATUS=""
+    if is_flapping "$TICKET_KEY"; then
+      FLAPPING_COUNT=$(get_state_changes_count "$TICKET_KEY")
+      FLAPPING_STATUS=" FLAPPING (${FLAPPING_COUNT} cambi in $((FLAPPING_WINDOW/60))min)"
+      log "FLAPPING rilevato per $TICKET_KEY"
+    fi
+    
+    # === LOGICA GESTIONE TICKET ===
+    if ticket_exists "$TICKET_KEY"; then
+      # Ticket già esiste -> aggiungi nota
+      TICKET_ID=$(get_ticket_id "$TICKET_KEY")
+      log "Ticket esistente trovato in cache: #$TICKET_ID"
+      
+      # Prepara nota privata sintetica
+      NOTE="[$(date '+%d/%m/%y %H:%M')] Servizio: ${SERVICE} | ${LAST_STATE} -> ${STATE}"
+      
+      # Aggiungi dettagli stato
+      if [[ "$STATE" == "OK" || "$STATE" == "UP" ]]; then
+        NOTE="${NOTE} |  Allarme rientrato"
+      elif [[ -n "$FLAPPING_STATUS" ]]; then
+        NOTE="${NOTE} | ${FLAPPING_STATUS}"
+      fi
+      
+      # Aggiungi output se significativo
+      NOTE="${NOTE} | Output: ${OUTPUT_SHORT}"
+      
+      # Aggiungi nota (verifica automaticamente se ticket esiste con 404 check)
+      add_private_note "$TICKET_ID" "$NOTE" || local note_result=$?
+      local note_result=${note_result:-0}
+      
+      if [[ $note_result -eq 0 ]]; then
+        # Nota aggiunta con successo - ticket esiste ed è aperto
+        log "Nota privata aggiunta al ticket #$TICKET_ID"
+        log_ticket_event "NOTA-AGGIUNTA" "$TICKET_ID" "Service: $HOSTNAME/$SERVICE, Stato: $STATE"
+        update_ticket_state "$TICKET_KEY" "$STATE"
+        
+        # Se stato è CRITICAL/DOWN, verifica se era risolto e logga riapertura
+        if [[ "$STATE" == "CRITICAL" || "$STATE" == "CRIT" || "$STATE" == "DOWN" ]]; then
+          local was_resolved
+          was_resolved=$(jq -r --arg key "$TICKET_KEY" '.[$key].resolved_at // "null"' "$TICKET_CACHE" 2>/dev/null)
+          if [[ "$was_resolved" != "null" ]]; then
+            log " Ticket #$TICKET_ID riaperto: problema tornato CRITICAL (resolved_at resettato)"
+            log_ticket_event "RIAPERTO" "$TICKET_ID" "Service: $HOSTNAME/$SERVICE, Stato: $STATE (era risolto)"
+          fi
+        fi
+        
+        # Se si aggrega per host, evita di marcare risolto su OK di un singolo servizio
+        if [[ "$STATE" == "OK" || "$STATE" == "UP" ]]; then
+          if [[ "$AGGREGATE_BY_HOST" != "1" || "$RESOLVE_ON_SERVICE_OK" == "1" ]]; then
+            mark_ticket_resolved "$TICKET_KEY"
+            log "Ticket #$TICKET_ID marcato come risolto, cleanup automatico tra 5 giorni"
+          else
+            log "Aggregazione per host attiva: non marco risolto su OK del servizio"
+          fi
+        fi
+        
+      elif [[ $note_result -eq 2 ]]; then
+        # Errore 404 - ticket non esiste più su Ydea (chiuso da operatore)
+        log "Ticket #$TICKET_ID non più valido (404), rimozione dalla cache"
+        remove_ticket_from_cache "$TICKET_KEY"
+        
+        # Se stato è ancora CRITICAL/DOWN/WARNING, crea un nuovo ticket
+        if [[ "$STATE" == "CRITICAL" || "$STATE" == "CRIT" || "$STATE" == "DOWN" || "$STATE" == "WARNING" || "$STATE" == "WARN" ]]; then
+          log " Stato ancora CRITICAL/WARNING dopo 404: creazione nuovo ticket"
+          
+          # Priorità sempre Bassa per monitoraggio Premium_Mon
+          PRIORITY="low"
+          
+          # SMART DETECTION: Rileva tipo alert e genera descrizione intelligente
+          ALERT_TYPE=$(detect_alert_type "$OUTPUT" "UP" "$STATE")
+          log " Alert Type Detected: $ALERT_TYPE"
+          
+          # Titolo con diagnosi leggibile
+          ALERT_LABEL=$(get_alert_label "$ALERT_TYPE" "SERVICE" "$SERVICE")
+          TITLE="[${STATE} - ${ALERT_LABEL}] ${HOSTNAME} - ${SERVICE}"
+          
+          # Descrizione SMART basata sul tipo di problema
+          DESCRIPTION=$(generate_smart_description "$ALERT_TYPE" "$HOSTNAME" "$REAL_IP" "$OUTPUT_SHORT" "$SERVICE" "$STATE" "$LAST_STATE")
+          
+          # Aggiungi nota sul ticket precedente chiuso
+          DESCRIPTION="${DESCRIPTION}
+
+Ticket precedente #${TICKET_ID} chiuso da operatore.
+
+Marcatore: $(build_cmk_marker \"$HOSTNAME\" \"$REAL_IP\")"
+          
+          # Crea nuovo ticket usando la funzione esistente
+          NEW_TICKET_ID=$(create_ydea_ticket "$TITLE" "$DESCRIPTION" "$PRIORITY" "$YDEA_CATEGORY_ID" "$HOSTNAME" "$SERVICE" "$OUTPUT")
+          
+          if [[ -n "$NEW_TICKET_ID" && "$NEW_TICKET_ID" != "null" ]]; then
+            log " Nuovo ticket creato: #$NEW_TICKET_ID (dopo 404 su #$TICKET_ID)"
+            save_ticket_cache "$TICKET_KEY" "$NEW_TICKET_ID" "$STATE"
+            log_ticket_event "CREATO" "$NEW_TICKET_ID" "Service: $HOSTNAME/$SERVICE, Stato: $STATE, Sostituisce #$TICKET_ID (eliminato)"
+          else
+            log " Errore creazione nuovo ticket dopo 404"
+          fi
+        elif [[ "$STATE" == "OK" || "$STATE" == "UP" ]]; then
+          # Stato OK dopo 404: ticket era già chiuso, nulla da fare
+          log "Stato OK dopo 404, ticket già chiuso dall'operatore"
+        fi
+        
+      else
+        # Altro errore generico aggiunta nota
+        log "Errore generico aggiunta nota al ticket #$TICKET_ID"
+      fi
+      
+    elif [[ "$STATE" == "CRIT" || "$STATE" == "CRITICAL" || "$STATE" == "DOWN" || "$STATE" == "WARNING" || "$STATE" == "WARN" ]]; then
+      # Nuovo problema CRITICAL/WARNING -> crea ticket
+      log "Nuovo problema CRITICAL/WARNING: verifica ticket esistente su Ydea (fallback)"
+
+      # Fallback: cerca ticket aperto esistente per host/IP quando si aggrega per host
+      if [[ "$AGGREGATE_BY_HOST" == "1" ]]; then
+        EXISTING_ID="$(find_ticket_by_marker "$HOSTNAME" "$REAL_IP" || true)"
+        [[ -z "$EXISTING_ID" ]] && EXISTING_ID="$(find_open_ticket_for_host "$HOSTNAME" "$REAL_IP" || true)"
+        if [[ -n "$EXISTING_ID" ]]; then
+          log "Trovato ticket aperto esistente #$EXISTING_ID per host $HOSTNAME/$REAL_IP"
+          NOTE="[$(date '+%d/%m/%y %H:%M')] Servizio: ${SERVICE} | ${LAST_STATE} -> ${STATE} | Output: ${OUTPUT_SHORT}"
+          if add_private_note "$EXISTING_ID" "$NOTE"; then
+            save_ticket_cache "$TICKET_KEY" "$EXISTING_ID" "$STATE"
+            log "Nota aggiunta al ticket esistente #$EXISTING_ID (niente nuovo ticket)"
+            exit 0
+          else
+            log "WARN: impossibile aggiungere nota al ticket esistente #$EXISTING_ID, procedo con creazione"
+          fi
+        fi
+      fi
+      
+      # Priorità sempre Bassa per monitoraggio Premium_Mon
+      PRIORITY="low"
+      
+      # SMART DETECTION: Rileva tipo alert e genera descrizione intelligente
+      ALERT_TYPE=$(detect_alert_type "$OUTPUT" "UP" "$STATE")
+      log " Alert Type Detected: $ALERT_TYPE"
+      
+      # Titolo con diagnosi leggibile
+      ALERT_LABEL=$(get_alert_label "$ALERT_TYPE" "SERVICE" "$SERVICE")
+      TITLE="[${STATE} - ${ALERT_LABEL}] ${HOSTNAME} - ${SERVICE}"
+      
+      # Descrizione SMART basata sul tipo di problema
+      DESCRIPTION=$(generate_smart_description "$ALERT_TYPE" "$HOSTNAME" "$REAL_IP" "$OUTPUT_SHORT" "$SERVICE" "$STATE" "$LAST_STATE")
+      
+      # Aggiungi marcatore nella descrizione per matching affidabile
+      MARKER=$(build_cmk_marker "$HOSTNAME" "$REAL_IP")
+      DESCRIPTION="${DESCRIPTION}
+
+Marcatore: ${MARKER}"
+      
+      # Crea ticket
+      TICKET_ID=$(create_ydea_ticket "$TITLE" "$DESCRIPTION" "$PRIORITY" "$YDEA_CATEGORY_ID" "$HOSTNAME" "$SERVICE" "$OUTPUT")
+      # Fallback: se l'ID non è disponibile, tenta recupero via marcatore
+      if [[ -z "$TICKET_ID" || "$TICKET_ID" == "null" ]]; then
+        TICKET_ID="$(find_ticket_by_marker "$HOSTNAME" "$REAL_IP" || true)"
+      fi
+      
+      if [[ -n "$TICKET_ID" ]]; then
+        log " Ticket creato: #$TICKET_ID per $TICKET_KEY"
+        save_ticket_cache "$TICKET_KEY" "$TICKET_ID" "$STATE"
+        log_ticket_event "CREATO" "$TICKET_ID" "Service: $HOSTNAME/$SERVICE, Stato: $STATE, Priorità: $PRIORITY"
+      else
+        log " Errore creazione ticket per $TICKET_KEY"
+      fi
+    else
+      # Stato UNKNOWN o altri stati non problematici -> solo log
+      log "Stato $STATE non problematico, nessun ticket creato"
+    fi
+    
+  else
+    # === ALERT HOST ===
+    STATE="${NOTIFY_HOSTSTATE:-UNKNOWN}"
+    LAST_STATE="${NOTIFY_LASTHOSTSTATE:-UNKNOWN}"
+    OUTPUT="${NOTIFY_HOSTOUTPUT:-N/A}"
+    STATE_TYPE="${NOTIFY_HOSTSTATETYPE:-HARD}"
+    
+    # Aggregazione per host: usa l'HOSTNAME come chiave
+    TICKET_KEY=$(get_ticket_key "$HOSTNAME" "HOST")
+    
+    OUTPUT_SHORT=$(format_output "$OUTPUT")
+    
+    log "HOST Alert: $HOSTNAME ($REAL_IP) | $LAST_STATE -> $STATE"
+    
+    # Registra cambio stato
+    record_state_change "$TICKET_KEY" "$STATE"
+    
+    # Verifica flapping
+    FLAPPING_STATUS=""
+    if is_flapping "$TICKET_KEY"; then
+      FLAPPING_COUNT=$(get_state_changes_count "$TICKET_KEY")
+      FLAPPING_STATUS=" FLAPPING (${FLAPPING_COUNT} cambi in $((FLAPPING_WINDOW/60))min)"
+    fi
+    
+    # Gestione ticket host
+    if ticket_exists "$TICKET_KEY"; then
+      TICKET_ID=$(get_ticket_id "$TICKET_KEY")
+      
+      NOTE="[$(date '+%d/%m/%y %H:%M')] HOST | ${LAST_STATE} -> ${STATE}"
+      if [[ "$STATE" == "OK" || "$STATE" == "UP" ]]; then
+        NOTE="${NOTE} | Allarme rientrato"
+      elif [[ -n "$FLAPPING_STATUS" ]]; then
+        NOTE="${NOTE} | ${FLAPPING_STATUS}"
+      fi
+      NOTE="${NOTE} | Output: ${OUTPUT_SHORT}"
+      
+      add_private_note "$TICKET_ID" "$NOTE" || local note_result=$?
+      local note_result=${note_result:-0}
+      
+      if [[ $note_result -eq 0 ]]; then
+        log "Nota privata aggiunta al ticket #$TICKET_ID"
+        log_ticket_event "NOTA-AGGIUNTA" "$TICKET_ID" "Host: $HOSTNAME, Stato: $STATE"
+        update_ticket_state "$TICKET_KEY" "$STATE"
+        
+        # Se stato passa a OK/UP, marca ticket come risolto (parte timer 5 giorni)
+        if [[ "$STATE" == "OK" || "$STATE" == "UP" ]]; then
+          mark_ticket_resolved "$TICKET_KEY"
+          log "Ticket #$TICKET_ID marcato come risolto, cleanup automatico tra 5 giorni"
+          log_ticket_event "RISOLTO-AUTO" "$TICKET_ID" "Host: $HOSTNAME, Stato: $STATE"
+        fi
+      elif [[ $note_result -eq 2 ]]; then
+        # Errore 404 - ticket non esiste più
+        log "Ticket #$TICKET_ID non più valido, rimozione dalla cache"
+        remove_ticket_from_cache "$TICKET_KEY"
+        
+        # Se lo stato è ancora critico, crea un nuovo ticket
+        if [[ "$STATE" == "DOWN" || "$STATE" == "CRITICAL" ]]; then
+          log "Stato ancora CRITICAL/DOWN, creazione nuovo ticket"
+          
+          PRIORITY="critical"
+          TITLE="[${STATE}] ${HOSTNAME} $(build_cmk_marker \"$HOSTNAME\" \"$REAL_IP\")"
+          
+          DESCRIPTION="*** ALERT CRITICO - SERVER NON RAGGIUNGIBILE ***
+
+>> SERVER COINVOLTO
+
+Nome: ${HOSTNAME}
+Indirizzo: ${REAL_IP}
+
+Stato attuale: ${STATE}
+Stato precedente: ${LAST_STATE}
+Data e ora: $(date '+%d/%m/%Y alle %H:%M')
+${FLAPPING_STATUS:+
+! ATTENZIONE: ${FLAPPING_STATUS}
+}
+
+>> PROBLEMA RILEVATO
+
+${OUTPUT_SHORT}
+
+>> AZIONI SUGGERITE
+
+1. Verificare la connettivita di rete del server
+2. Controllare lo stato dell'hardware o della macchina virtuale
+3. Verificare i log di sistema per errori
+4. Valutare il riavvio dei servizi se necessario
+
+Tentativo: ${NOTIFY_HOSTATTEMPT:-1}/${NOTIFY_HOSTMAXATTEMPTS:-3}
+Tipo: ${STATE_TYPE}
+
+---
+! NOTA: Il ticket precedente #${TICKET_ID} non era piu disponibile
+Questo e un nuovo ticket creato automaticamente
+---
+Ticket generato dal sistema di monitoraggio
+Sito: ${NOTIFY_OMD_SITE:-monitoring}\n\nMarcatore: $(build_cmk_marker \"$HOSTNAME\" \"$REAL_IP\")"
+          
+          NEW_TICKET_ID=$(create_ydea_ticket "$TITLE" "$DESCRIPTION" "$PRIORITY" "$YDEA_CATEGORY_ID" "$HOSTNAME" "HOST" "$OUTPUT")
+          
+          if [[ -n "$NEW_TICKET_ID" ]]; then
+            log " Nuovo ticket creato: #$NEW_TICKET_ID (sostituisce #$TICKET_ID)"
+            save_ticket_cache "$TICKET_KEY" "$NEW_TICKET_ID" "$STATE"
+            log_ticket_event "CREATO" "$NEW_TICKET_ID" "Host: $HOSTNAME, Stato: $STATE, Sostituisce #$TICKET_ID (eliminato)"
+          fi
+        else
+          log "Stato $STATE non critico, nessun nuovo ticket creato"
+        fi
+      else
+        # Altro errore generico
+        log "Errore generico aggiunta nota al ticket #$TICKET_ID"
+      fi
+      
+    elif [[ "$STATE" == "DOWN" || "$STATE" == "CRITICAL" || "$STATE" == "WARNING" || "$STATE" == "WARN" ]]; then
+      log "Nuovo problema HOST DOWN/CRITICAL/WARNING: creazione ticket"
+
+      # Fallback: cerca ticket aperto esistente per host/IP
+      if [[ "$AGGREGATE_BY_HOST" == "1" ]]; then
+        EXISTING_ID="$(find_ticket_by_marker "$HOSTNAME" "$REAL_IP" || true)"
+        [[ -z "$EXISTING_ID" ]] && EXISTING_ID="$(find_open_ticket_for_host "$HOSTNAME" "$REAL_IP" || true)"
+        if [[ -n "$EXISTING_ID" ]]; then
+          log "Trovato ticket aperto esistente #$EXISTING_ID per host $HOSTNAME/$REAL_IP"
+          NOTE="[$(date '+%d/%m/%y %H:%M')] HOST | ${LAST_STATE} -> ${STATE} | Output: ${OUTPUT_SHORT}"
+          if add_private_note "$EXISTING_ID" "$NOTE"; then
+            save_ticket_cache "$TICKET_KEY" "$EXISTING_ID" "$STATE"
+            log "Nota aggiunta al ticket esistente #$EXISTING_ID (niente nuovo ticket)"
+            exit 0
+          else
+            log "WARN: impossibile aggiungere nota al ticket esistente #$EXISTING_ID, procedo con creazione"
+          fi
+        fi
+      fi
+      
+      # Priorità sempre Bassa per monitoraggio Premium_Mon
+      PRIORITY="low"
+      
+      # SMART DETECTION: Rileva tipo alert HOST e genera descrizione intelligente
+      ALERT_TYPE=$(detect_alert_type "$OUTPUT" "$STATE" "CRIT")
+      log " Alert Type Detected: $ALERT_TYPE"
+      
+      # Titolo con diagnosi leggibile
+      ALERT_LABEL=$(get_alert_label "$ALERT_TYPE" "HOST" "")
+      TITLE="[${STATE} - ${ALERT_LABEL}] ${HOSTNAME}"
+      
+      # Descrizione SMART basata sul tipo di problema
+      DESCRIPTION=$(generate_smart_description "$ALERT_TYPE" "$HOSTNAME" "$REAL_IP" "$OUTPUT_SHORT" "HOST" "$STATE" "$LAST_STATE")
+      
+      TICKET_ID=$(create_ydea_ticket "$TITLE" "$DESCRIPTION" "$PRIORITY" "$YDEA_CATEGORY_ID" "$HOSTNAME" "HOST" "$OUTPUT")
+      if [[ -z "$TICKET_ID" || "$TICKET_ID" == "null" ]]; then
+        TICKET_ID="$(find_ticket_by_marker "$HOSTNAME" "$REAL_IP" || true)"
+      fi
+      
+      if [[ -n "$TICKET_ID" ]]; then
+        log " Ticket creato: #$TICKET_ID per $TICKET_KEY"
+        save_ticket_cache "$TICKET_KEY" "$TICKET_ID" "$STATE"
+        log_ticket_event "CREATO" "$TICKET_ID" "Host: $HOSTNAME, Stato: $STATE, Priorità: $PRIORITY"
+      fi
+    fi
+  fi
+}
+
+# Converte ALERT_TYPE in label leggibile per titolo
+get_alert_label() {
+  local alert_type="$1"
+  local what_type="$2"  # "HOST" o "SERVICE"
+  local service_name="$3"  # Nome servizio se SERVICE
+  
+  # Per alert HOST usa "HOST UNREACHABLE"
+  if [[ "${what_type}" == "HOST" ]]; then
+    echo "HOST UNREACHABLE"
+    return
+  fi
+  
+  # Per alert SERVICE: gestisci in base al tipo di problema
+  case "$alert_type" in
+    COMMUNICATION_TIMEOUT)
+      echo "COMUNICATION TIMEOUT"
+      ;;
+    HOST_OFFLINE_REFUSED|HOST_OFFLINE_NETWORK|HOST_OFFLINE_TIMEOUT|HOST_NODATA)
+      echo "HOST UNREACHABLE"
+      ;;
+    *)
+      echo "${service_name:-SERVIZIO}"
+      ;;
+  esac
+}
+
+# Rileva il tipo di problema basato sull'output e stato
+detect_alert_type() {
+  local output="$1"
+  # shellcheck disable=SC2034
+  local host_state="$2"  # "UP" per service problem, "DOWN" per host down
+  # shellcheck disable=SC2034
+  local service_state="$3"  # per future use
+  
+  # Converti output in minuscolo per matching case-insensitive
+  local output_lower
+  output_lower=$(echo "$output" | tr '[:upper:]' '[:lower:]')
+  
+  # COMMUNICATION TIMEOUT = Service Check Timed Out (specifico CheckMK)
+  if echo "$output_lower" | grep -qi "service check timed out\|check timed out"; then
+    echo "COMMUNICATION_TIMEOUT"
+    return 0
+  fi
+  
+  # DOWN = Connection Refused
+  if echo "$output_lower" | grep -qi "connection refused\|errno 111\|connessione.*rifiutata"; then
+    echo "HOST_OFFLINE_REFUSED"
+    return 0
+  fi
+  
+  # DOWN = Network Unreachable
+  if echo "$output_lower" | grep -qi "network unreachable\|errno 113\|rete.*non.*raggiungibile"; then
+    echo "HOST_OFFLINE_NETWORK"
+    return 0
+  fi
+  
+  # DOWN = Timeout generico
+  if echo "$output_lower" | grep -qi "timeout\|timed out\|no route"; then
+    echo "HOST_OFFLINE_TIMEOUT"
+    return 0
+  fi
+  
+  # NO DATA = Missing data
+  if echo "$output_lower" | grep -qi "no data\|piggyback\|missing.*data\|stale cache"; then
+    echo "HOST_NODATA"
+    return 0
+  fi
+  
+  # Unknown
+  echo "UNKNOWN"
+  return 0
+}
+
+# Genera descrizione smart basata sul tipo di alert
+generate_smart_description() {
+  local alert_type="$1"
+  local hostname="$2"
+  local ip="$3"
+  local output="$4"
+  local service="$5"
+  local state="$6"
+  # shellcheck disable=SC2034
+  local last_state="$7"
+  
+  local description=""
+  
+  case "$alert_type" in
+    HOST_OFFLINE_REFUSED)
+      description="*** ALERT - CONNESSIONE RIFIUTATA ***
+
+Host: ${hostname} (${ip})
+Servizio: ${service}
+Stato: ${state}
+
+[CMK HOST=${hostname} IP=${ip}]"
+      ;;
+    
+    HOST_OFFLINE_NETWORK)
+      description="*** ALERT - NETWORK UNREACHABLE ***
+
+Host: ${hostname} (${ip})
+Servizio: ${service}
+Stato: ${state}
+
+[CMK HOST=${hostname} IP=${ip}]"
+      ;;
+    
+    HOST_OFFLINE_TIMEOUT)
+      description="*** ALERT - HOST TIMEOUT ***
+
+Host: ${hostname} (${ip})
+Servizio: ${service}
+Stato: ${state}
+
+[CMK HOST=${hostname} IP=${ip}]"
+      ;;
+    
+    HOST_NODATA)
+      description="*** ALERT - DATI DI MONITORAGGIO MANCANTI ***
+
+Host: ${hostname} (${ip})
+Servizio: ${service}
+Stato: ${state}
+
+[CMK HOST=${hostname} IP=${ip}]"
+      ;;
+    
+    *)
+      # Fallback generico
+      description="*** ALERT MONITORAGGIO ***
+
+Host: ${hostname} (${ip})
+Servizio: ${service}
+Stato: ${state}
+Output: ${output}
+
+[CMK HOST=${hostname} IP=${ip}]"
+      ;;
+  esac
+  
+  echo "$description"
+}
+
+# Esegui main
+main
+
+exit 0

@@ -1,0 +1,36 @@
+[Unit]
+Description=CheckMK Agent Synchronization Service
+Documentation=https://github.com/nethesis/checkmk-tools
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/checkmk-agent-sync/checkmk-agent-sync.env
+ExecStart=/usr/bin/python3 -B /opt/checkmk-tools/script-tools/full/agent_maintenance/checkmk-agent-autoupdate-linux.py \
+    --server-url ${CHECKMK_SERVER_URL} \
+    --site ${CHECKMK_SITE} \
+    --target auto \
+    --verbose
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=checkmk-agent-sync
+
+# Non-destructive on failure
+FailureAction=none
+TimeoutStartSec=600
+
+# Security hardening
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var /opt/checkmk-tools /usr/lib/check_mk_agent /usr/bin /etc /usr/lib/systemd/system /lib/systemd/system
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
