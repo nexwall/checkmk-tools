@@ -1,9 +1,0 @@
-* text=auto
-*.sh text eol=lf
-*.py text eol=lf
-*.json text eol=lf
-*.ps1 text eol=crlf
-*.bat text eol=crlf
-*.md text eol=lf
-script-notify-checkmk/beta/M@il-20 text eol=lf
-script-notify-checkmk/beta/Telegram-20 text eol=lf
